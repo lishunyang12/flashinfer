@@ -84,6 +84,44 @@ def test_ragged_public_wrapper(causal, out_dtype):
     torch.testing.assert_close(actual_lse, torch.cat(lses), atol=0.2, rtol=0.2)
 
 
+def test_ragged_public_wrapper_skip_softmax():
+    """The public PRIMS wrapper forwards skip-softmax to the SM120 kernel."""
+    h, d, sq, skv = 2, 64, 64, 256
+    q = torch.zeros(sq, h, d, device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.zeros(skv, h, d, device="cuda", dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(k)
+    v[:128] = -1
+    v[128:] = 1
+    qo = torch.tensor([0, sq], device="cuda", dtype=torch.int32)
+    kv = torch.tensor([0, skv], device="cuda", dtype=torch.int32)
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="cute-dsl-prims"
+    )
+    wrapper.plan(
+        qo,
+        kv,
+        h,
+        h,
+        d,
+        q_data_type=q.dtype,
+        kv_data_type=k.dtype,
+        o_data_type=torch.float16,
+    )
+
+    dense = wrapper.run(q, k, v)
+    skipped = wrapper.run(
+        q,
+        k,
+        v,
+        # effective threshold = 512 / 256 = 2, so the left tile is skipped
+        skip_softmax_threshold_scale_factor=512.0,
+    )
+
+    torch.testing.assert_close(dense, torch.zeros_like(dense), atol=1e-3, rtol=0)
+    torch.testing.assert_close(skipped, torch.ones_like(skipped), atol=1e-3, rtol=0)
+
+
 @pytest.mark.parametrize("page_size", [16, 32, 64, 128])
 def test_paged_public_wrapper(page_size):
     hq, hkv, d = 4, 2, 32
