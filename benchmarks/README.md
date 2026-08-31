@@ -612,6 +612,16 @@ python benchmarks/flashinfer_benchmark.py \
   --q_dtype fp8_e4m3 --kv_dtype fp8_e4m3 \
   --out_dtype bfloat16 --causal --refcheck -vv
 ```
+
+Use the dedicated skip-softmax microbenchmark to compare the dense kernel,
+the skip specialization with no tiles omitted, and a skip-friendly input:
+
+```bash
+python benchmarks/bench_sm120_skip_softmax.py \
+  --batch-size 1 --q-len 256 --kv-len 4096 \
+  --num-q-heads 32 --num-kv-heads 8 --head-dim 128 \
+  --skip-scale-factor 1 --warmup 20 --repeat 100
+```
 - moe_a2a: MoE All-to-All communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
 - allreduce: AllReduce fusion communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
 - triton: Triton reference kernels (used for Mamba selective_state_update and GDN decode/MTP)
