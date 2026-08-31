@@ -35,7 +35,9 @@ def _reference(q, k, v, causal, scale):
 
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
-def test_ragged_public_wrapper(causal, out_dtype):
+@pytest.mark.parametrize("skips_softmax", [False, True])
+def test_ragged_public_wrapper(causal, out_dtype, skips_softmax):
+    torch.manual_seed(0)
     hq, hkv, d = 4, 2, 32
     q_lens, kv_lens = [3, 2], [5, 4]
     qo = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
@@ -67,6 +69,9 @@ def test_ragged_public_wrapper(causal, out_dtype):
         k_scale=k_scale,
         v_scale=v_scale,
         enable_pdl=True,
+        # Match the SM100 integration tests: exercise the skip-softmax
+        # specialization with a threshold too small to skip any real tile.
+        skip_softmax_threshold_scale_factor=1e-30 if skips_softmax else None,
     )
     assert actual is out
     refs, lses = [], []
@@ -123,7 +128,9 @@ def test_ragged_public_wrapper_skip_softmax():
 
 
 @pytest.mark.parametrize("page_size", [16, 32, 64, 128])
-def test_paged_public_wrapper(page_size):
+@pytest.mark.parametrize("skips_softmax", [False, True])
+def test_paged_public_wrapper(page_size, skips_softmax):
+    torch.manual_seed(0)
     hq, hkv, d = 4, 2, 32
     qo = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
     page_indptr = torch.tensor([0, 1, 3], dtype=torch.int32, device="cuda")
@@ -163,7 +170,14 @@ def test_paged_public_wrapper(page_size):
         kv_data_type=k_pool.dtype,
         o_data_type=torch.bfloat16,
     )
-    actual, actual_lse = wrapper.run_return_lse(q, combined_cache, enable_pdl=True)
+    actual, actual_lse = wrapper.run_return_lse(
+        q,
+        combined_cache,
+        enable_pdl=True,
+        # Match the SM100 integration tests: select the skip-softmax kernel
+        # without changing the expected dense-attention result.
+        skip_softmax_threshold_scale_factor=1e-30 if skips_softmax else None,
+    )
     refs, lses = [], []
     for batch, (q_start, q_end) in enumerate(zip(qo[:-1], qo[1:], strict=False)):
         pages = page_indices[page_indptr[batch] : page_indptr[batch + 1]]

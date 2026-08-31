@@ -115,6 +115,6 @@ run_python -m pytest -q -s \
   -k "sm120_ragged_skip_softmax_omits_negligible_tiles"
 run_python -m pytest -q -s \
   "${repo_root}/tests/attention/test_sm120_prims_prefill_backend.py" \
-  -k "ragged_public_wrapper_skip_softmax"
+  -k "ragged_public_wrapper or paged_public_wrapper"
 
 echo "SM120_SKIP_SOFTMAX_VALIDATION: PASS"
