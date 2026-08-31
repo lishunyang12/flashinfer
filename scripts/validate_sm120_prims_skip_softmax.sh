@@ -9,6 +9,7 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 required_code_commit="f764a6c868543fcf581da43b4ecef4de9b5aaa6a"
 gpu_id="${GPU_ID:-0}"
 validation_overlay="${VALIDATION_OVERLAY:-$(dirname "${repo_root}")/.flashinfer-sm120-validation}"
+jit_cache_base="${JIT_CACHE_BASE:-$(dirname "${repo_root}")/.flashinfer-sm120-jit}"
 result_base="${RESULT_BASE:-$(dirname "${repo_root}")/sm120-skip-results}"
 result_root="${result_base}/$(date -u +%Y%m%dT%H%M%SZ)"
 
@@ -34,6 +35,7 @@ echo "RESULT_ROOT=${result_root}"
 echo "REPO_ROOT=${repo_root}"
 echo "GPU_ID=${gpu_id}"
 echo "PYTHON_BIN=${base_python:-NOT_FOUND}"
+echo "FLASHINFER_WORKSPACE_BASE=${jit_cache_base}"
 hostname
 date -u
 
@@ -80,7 +82,8 @@ if capability != (12, 0):
 PY
 
 export CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION:-4.7.1}"
-mkdir -p "${validation_overlay}"
+export FLASHINFER_WORKSPACE_BASE="${jit_cache_base}"
+mkdir -p "${validation_overlay}" "${FLASHINFER_WORKSPACE_BASE}"
 "${base_python}" -m pip install --upgrade --target "${validation_overlay}" \
   pytest \
   "packaging>=24.2" \
