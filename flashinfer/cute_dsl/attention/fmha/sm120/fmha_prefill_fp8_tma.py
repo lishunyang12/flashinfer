@@ -1782,6 +1782,99 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             pass
 
     @cute.jit
+    def should_skip_softmax(
+        self,
+        basic_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        s_regs: cutlass.Array,
+        row_state: cutlass.Float32,
+        kv_seq_idx: cutlass.Int32,
+        is_masked_frontier_tile: cutlass.Constexpr[bool],
+    ) -> cutlass.Boolean:
+        """Return a warp-uniform decision to skip this K/V tile.
+
+        Each compute warp owns 16 complete query rows.  A tile may be skipped
+        only when every valid row owned by the warp is below the configured
+        threshold.  Keeping the decision warp-uniform lets the caller omit
+        both online-softmax state updates and the PV MMA without introducing
+        divergent MMA execution.
+        """
+        uses_distributed_row_state = cutlass.const_expr(
+            self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
+        )
+        if cutlass.const_expr(not uses_distributed_row_state):
+            row_max = softmax_params.row_max
+
+        thread_wants_skip = cutlass.Boolean(True)
+        for row_half in cutlass.range_constexpr(2):
+            q_row_in_cta = (
+                basic_params.q_warp_row0 + basic_params.lane_div4 + row_half * 8
+            )
+            q_row_is_valid = (
+                basic_params.q_seq_idx + q_row_in_cta < basic_params.seqlen_q
+            )
+
+            valid_cols = basic_params.seqlen_k
+            has_valid_cols = True
+            if cutlass.const_expr(is_masked_frontier_tile):
+                if cutlass.const_expr(self.is_causal):
+                    valid_cols = cute.math.min(
+                        basic_params.q_seq_idx
+                        + q_row_in_cta
+                        + basic_params.causal_q_offset
+                        + 1,
+                        basic_params.seqlen_k,
+                    )
+                    has_valid_cols = kv_seq_idx < valid_cols
+
+            tile_row_max = -cutlass.Float32.inf
+            for k_frag in cutlass.range_constexpr(self.qk_k_frags):
+                s_off = k_frag * 4
+                s0 = s_regs[s_off + row_half * 2]
+                s1 = s_regs[s_off + row_half * 2 + 1]
+                if cutlass.const_expr(is_masked_frontier_tile):
+                    k_col0 = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4
+                    k_col1 = k_col0 + 1
+                    if cutlass.const_expr(self.is_causal):
+                        valid0 = k_col0 < valid_cols if has_valid_cols else False
+                        valid1 = k_col1 < valid_cols if has_valid_cols else False
+                    else:
+                        valid0 = k_col0 < valid_cols
+                        valid1 = k_col1 < valid_cols
+                    if not valid0:
+                        s0 = -cutlass.Float32.inf
+                    if not valid1:
+                        s1 = -cutlass.Float32.inf
+                tile_row_max = cute.arch.fmax(tile_row_max, s0)
+                tile_row_max = cute.arch.fmax(tile_row_max, s1)
+
+            if cutlass.const_expr(uses_distributed_row_state):
+                tile_row_max = nvvm_threadquad_reduction_max(tile_row_max)
+                previous_row_max = prims.shfl_sync(
+                    thread_mask=0xFFFFFFFF,
+                    val=row_state,
+                    offset=row_half,
+                    mask_and_clamp=0x1C03,
+                    kind=prims.Shfl.IDX,
+                )
+            else:
+                tile_row_max = nvvm_threadquad_reduction_max_full(tile_row_max)
+                previous_row_max = row_max[row_half]
+
+            row_wants_skip = cutlass.Boolean(False)
+            if not q_row_is_valid or tile_row_max == -cutlass.Float32.inf:
+                row_wants_skip = cutlass.Boolean(True)
+            elif previous_row_max != -cutlass.Float32.inf:
+                row_wants_skip = (
+                    (tile_row_max - previous_row_max)
+                    * softmax_params.softmax_scale_log2
+                    < softmax_params.skip_softmax_threshold_log2
+                )
+            thread_wants_skip = thread_wants_skip and row_wants_skip
+
+        return cute.arch.vote_all_sync(thread_wants_skip)
+
+    @cute.jit
     def compute_one_kv_tile(
         self,
         basic_params: SimpleNamespace,
@@ -1838,23 +1931,51 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             )
 
         kv_seq_idx = kv_tile_idx * self.kv_tile
-        p_regs, row_state = self.online_softmax(
-            basic_params,
-            mma_params,
-            softmax_params,
-            s_regs,
-            row_state,
-            kv_seq_idx,
-            is_masked_frontier_tile,
-            uses_softmax_init_path,
-        )
-        # Softmax has no V dependency. Delay the arrival wait until the first
-        # V consumer so its scalar work can hide the outstanding TMA transfer.
+        enable_skip_softmax = softmax_params.skip_softmax_threshold_log2 is not None
+        skip_softmax = cutlass.Boolean(False)
+        if cutlass.const_expr(enable_skip_softmax and not uses_softmax_init_path):
+            skip_softmax = self.should_skip_softmax(
+                basic_params,
+                softmax_params,
+                s_regs,
+                row_state,
+                kv_seq_idx,
+                is_masked_frontier_tile,
+            )
         v_arrived = self.get_mbar_stage_ptr(basic_params.mbar_arrived, v_stage)
-        self.wait_pipeline_barrier(v_arrived, v_phase)
-
         sV = self.get_kv_stage_ptr(mma_params.sKV, v_stage)
-        self.mma_pv(basic_params, mma_params, p_regs, sV)
+        if cutlass.const_expr(enable_skip_softmax):
+            if not skip_softmax:
+                p_regs, row_state = self.online_softmax(
+                    basic_params,
+                    mma_params,
+                    softmax_params,
+                    s_regs,
+                    row_state,
+                    kv_seq_idx,
+                    is_masked_frontier_tile,
+                    uses_softmax_init_path,
+                )
+                # Softmax has no V dependency. Delay the arrival wait until
+                # the first V consumer so scalar work hides the TMA transfer.
+                self.wait_pipeline_barrier(v_arrived, v_phase)
+                self.mma_pv(basic_params, mma_params, p_regs, sV)
+            else:
+                # Even a skipped tile must consume its V pipeline slot.
+                self.wait_pipeline_barrier(v_arrived, v_phase)
+        else:
+            p_regs, row_state = self.online_softmax(
+                basic_params,
+                mma_params,
+                softmax_params,
+                s_regs,
+                row_state,
+                kv_seq_idx,
+                is_masked_frontier_tile,
+                uses_softmax_init_path,
+            )
+            self.wait_pipeline_barrier(v_arrived, v_phase)
+            self.mma_pv(basic_params, mma_params, p_regs, sV)
         if prims.elect_sync():
             v_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, v_stage)
             prims.mbarrier_arrive(
@@ -1889,28 +2010,57 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 count=cute.arch.WARP_SIZE,
             )
 
+        kv_seq_idx = kv_tile_idx * self.kv_tile
+        enable_skip_softmax = softmax_params.skip_softmax_threshold_log2 is not None
+        skip_softmax = cutlass.Boolean(False)
+        if cutlass.const_expr(enable_skip_softmax and not uses_softmax_init_path):
+            skip_softmax = self.should_skip_softmax(
+                basic_params,
+                softmax_params,
+                s_regs,
+                cutlass.Float32(0.0),
+                kv_seq_idx,
+                is_masked_frontier_tile,
+            )
+
         while not prims.mbarrier_try_wait_parity(
             basic_params.mbar_v_arrived, tma_phase, time_limit=10_000_000
         ):
             pass
 
-        kv_seq_idx = kv_tile_idx * self.kv_tile
-        p_regs, v_initial = self.online_softmax_single_buffer(
-            basic_params,
-            mma_params,
-            softmax_params,
-            s_regs,
-            kv_seq_idx,
-            is_masked_frontier_tile,
-            uses_softmax_init_path,
-        )
-
-        self.mma_pv_single_buffer_preloaded(
-            basic_params,
-            mma_params,
-            p_regs,
-            v_initial,
-        )
+        if cutlass.const_expr(enable_skip_softmax):
+            if not skip_softmax:
+                p_regs, v_initial = self.online_softmax_single_buffer(
+                    basic_params,
+                    mma_params,
+                    softmax_params,
+                    s_regs,
+                    kv_seq_idx,
+                    is_masked_frontier_tile,
+                    uses_softmax_init_path,
+                )
+                self.mma_pv_single_buffer_preloaded(
+                    basic_params,
+                    mma_params,
+                    p_regs,
+                    v_initial,
+                )
+        else:
+            p_regs, v_initial = self.online_softmax_single_buffer(
+                basic_params,
+                mma_params,
+                softmax_params,
+                s_regs,
+                kv_seq_idx,
+                is_masked_frontier_tile,
+                uses_softmax_init_path,
+            )
+            self.mma_pv_single_buffer_preloaded(
+                basic_params,
+                mma_params,
+                p_regs,
+                v_initial,
+            )
         if prims.elect_sync():
             prims.mbarrier_arrive(
                 basic_params.mbar_v_consumed,
@@ -1929,6 +2079,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
+        skip_softmax_threshold_log2: cutlass.Float32 | None,
         seqlens_kv: cute.Tensor | None = None,
         cu_seqlens_q: cute.Tensor | None = None,
         block_tables: cute.Tensor | None = None,
@@ -2349,6 +2500,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 )
                 softmax_params = SimpleNamespace(
                     softmax_scale_log2=softmax_scale_log2,
+                    skip_softmax_threshold_log2=skip_softmax_threshold_log2,
                 )
             else:
                 mma_params = SimpleNamespace(
@@ -2361,6 +2513,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     row_max=row_max,
                     row_sum=row_sum,
                     softmax_scale_log2=softmax_scale_log2,
+                    skip_softmax_threshold_log2=skip_softmax_threshold_log2,
                 )
 
             # Load Q into registers.
@@ -2636,6 +2789,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         lse: cute.Tensor | None,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
+        skip_softmax_threshold_log2: cutlass.Float32 | None,
         stream: cuda_driver.CUstream,
         seqlens_kv: cute.Tensor | None = None,
         cu_seqlens_q: cute.Tensor | None = None,
@@ -2656,6 +2810,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param lse: Optional packed float32 log2 LSE ``(total_q,Hq)``.
         :param softmax_scale_log2: ``softmax_scale * log2(e)``.
         :param output_scale: Scalar multiplier applied to normalized output.
+        :param skip_softmax_threshold_log2: Log2 threshold for omitting tiles
+            whose contribution is negligible. ``None`` selects the dense
+            specialization.
         :param stream: CUDA stream used for the launch.
         :param seqlens_kv: Runtime K/V lengths, one Int32 per request.
         :param cu_seqlens_q: Packed-Q cumulative Int32 offsets.
@@ -2754,6 +2911,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             tma_v_desc,
             softmax_scale_log2,
             output_scale,
+            skip_softmax_threshold_log2,
             seqlens_kv,
             cu_seqlens_q,
             block_tables,

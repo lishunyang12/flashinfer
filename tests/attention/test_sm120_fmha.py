@@ -267,6 +267,36 @@ def test_sm120_ragged_empty_kv_return_lse():
     assert torch.isneginf(lse).all()
 
 
+def test_sm120_ragged_skip_softmax_omits_negligible_tiles():
+    """A threshold above one deterministically keeps only the first KV tile."""
+    H, D, Sq, Skv = 2, 64, 64, 256
+    q = torch.zeros(Sq, H, D, device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.zeros(Skv, H, D, device="cuda", dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(k)
+    v[:128] = -1
+    v[128:] = 1
+    cu_q = torch.tensor([0, Sq], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, Skv], device="cuda", dtype=torch.int32)
+    dense = torch.empty(Sq, H, D, device="cuda", dtype=torch.float16)
+    skipped = torch.empty_like(dense)
+
+    sm120_fmha_fp8_ragged_prefill(q, k, v, dense, cu_q, cu_k)
+    sm120_fmha_fp8_ragged_prefill(
+        q,
+        k,
+        v,
+        skipped,
+        cu_q,
+        cu_k,
+        max_seqlen_k=Skv,
+        # effective threshold = 512 / 256 = 2, so the left tile is skipped
+        skip_softmax_threshold_scale_factor=512.0,
+    )
+
+    torch.testing.assert_close(dense, torch.zeros_like(dense), atol=1e-3, rtol=0)
+    torch.testing.assert_close(skipped, torch.ones_like(skipped), atol=1e-3, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # Paged prefill shared block-table contract
 # ---------------------------------------------------------------------------

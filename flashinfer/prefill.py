@@ -2967,11 +2967,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
                 )
-            if skip_softmax_threshold_scale_factor is not None:
-                raise NotImplementedError(
-                    "backend='cute-dsl-prims' does not support "
-                    "skip_softmax_threshold_scale_factor"
-                )
             if window_left is not None and window_left != self._window_left:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not support a run-time "
@@ -3000,6 +2995,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             )
 
         check_trtllm_gen_sm107_only_feature(
@@ -4162,6 +4158,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
@@ -4178,6 +4175,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
@@ -4198,6 +4196,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
@@ -4232,6 +4231,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only effective on backends and devices that support PDL.
+        skip_softmax_threshold_scale_factor : Optional[float]
+            Threshold scale factor for skipping negligible K/V tiles. The
+            effective threshold is the supplied factor divided by the maximum
+            K/V sequence length. Supported by ``cute-dsl-prims``; ``None`` or
+            zero selects its dense specialization.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV input.  Accepts either a single
             packed scale tensor or a ``(k_scales, v_scales)`` tuple matching the
@@ -4281,6 +4285,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not support o_scale"
                 )
+        elif skip_softmax_threshold_scale_factor not in (None, 0):
+            raise NotImplementedError(
+                "BatchPrefillWithRaggedKVCacheWrapper currently supports "
+                "skip_softmax_threshold_scale_factor only with "
+                "backend='cute-dsl-prims'"
+            )
 
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
@@ -4358,6 +4368,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             )
             return (out, lse) if return_lse else out
         elif self._backend == "fmha_v2":

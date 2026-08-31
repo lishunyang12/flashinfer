@@ -89,6 +89,12 @@
       "dtype": "int32",
       "optional": true,
       "description": "Bool: also return LSE."
+    },
+    "skip_softmax_threshold_scale_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Threshold scale factor for skip-softmax sparsity."
     }
   },
   "outputs": {

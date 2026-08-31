@@ -1564,6 +1564,11 @@ gqa_ragged_prefill_trace = TraceTemplate(
         "return_lse": Scalar(
             "int32", optional=True, description="Bool: also return LSE."
         ),
+        "skip_softmax_threshold_scale_factor": Scalar(
+            "float32",
+            optional=True,
+            description="Threshold scale factor for skip-softmax sparsity.",
+        ),
     },
     outputs={
         "output": Tensor(

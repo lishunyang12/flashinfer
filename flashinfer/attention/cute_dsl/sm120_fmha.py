@@ -167,6 +167,23 @@ def _validate_lse(q: torch.Tensor, lse: Optional[torch.Tensor]) -> None:
         raise ValueError("lse must be contiguous")
 
 
+def _skip_softmax_threshold_log2(
+    scale_factor: Optional[float], max_kv_len: int
+) -> Optional[Float32]:
+    """Convert the public scale factor to the kernel's log2 threshold."""
+    if scale_factor is None or scale_factor == 0:
+        return None
+    scale_factor = float(scale_factor)
+    if not math.isfinite(scale_factor) or scale_factor < 0:
+        raise ValueError(
+            "skip_softmax_threshold_scale_factor must be finite and >= 0; "
+            f"got {scale_factor!r}"
+        )
+    if max_kv_len <= 0:
+        return None
+    return Float32(math.log2(scale_factor / max_kv_len))
+
+
 def _validate_hnd_paged_pool(name: str, pool: torch.Tensor) -> None:
     """Validate the HND inner layout while allowing combined-cache views."""
     if pool.ndim != 4:
@@ -203,6 +220,8 @@ def sm120_fmha_fp8_ragged_prefill(
     lse: Optional[torch.Tensor] = None,
     v_scale: Optional[float] = None,
     enable_pdl: bool = False,
+    max_seqlen_k: Optional[int] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
 ) -> None:
     """Run SM120 FP8 FMHA on packed contiguous ragged Q/K/V.
 
@@ -237,6 +256,13 @@ def sm120_fmha_fp8_ragged_prefill(
         Scalar multiplier folded into the normalized output. Defaults to 1.
     enable_pdl : bool
         Whether to enable Programmatic Dependent Launch.
+    max_seqlen_k : int, optional
+        Maximum K/V sequence length. Supplying it avoids a device-to-host
+        synchronization when skip-softmax is enabled.
+    skip_softmax_threshold_scale_factor : float, optional
+        Skip a K/V tile when all rows owned by a compute warp satisfy
+        ``exp(tile_max - running_max) < scale_factor / max_seqlen_k``.
+        ``None`` or zero selects the dense specialization.
     Raises
     ------
     RuntimeError
@@ -275,6 +301,12 @@ def sm120_fmha_fp8_ragged_prefill(
     cu_seqlens_k_i32 = cu_seqlens_k.to(torch.int32)
     if max_seqlen_q is None:
         max_seqlen_q = int((cu_seqlens_q_i32[1:] - cu_seqlens_q_i32[:-1]).max().item())
+    if skip_softmax_threshold_scale_factor and max_seqlen_k is None:
+        max_seqlen_k = int((cu_seqlens_k_i32[1:] - cu_seqlens_k_i32[:-1]).max().item())
+    skip_threshold_log2 = _skip_softmax_threshold_log2(
+        skip_softmax_threshold_scale_factor,
+        0 if max_seqlen_k is None else max_seqlen_k,
+    )
 
     kv_tile = kv_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_KV_TILES[0]
     q_tile = q_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_Q_TILES[0]
@@ -303,6 +335,7 @@ def sm120_fmha_fp8_ragged_prefill(
         with_lse=lse is not None,
         balanced_scheduler=_use_balanced_scheduler(is_causal),
         use_pdl=enable_pdl,
+        enable_skip_softmax=skip_threshold_log2 is not None,
     )
 
     if sm_scale is None:
@@ -318,6 +351,7 @@ def sm120_fmha_fp8_ragged_prefill(
         lse,
         scale_log2,
         output_scale,
+        skip_threshold_log2,
         None,
         cu_seqlens_q_i32,
         None,
@@ -348,6 +382,8 @@ def sm120_fmha_fp8_paged_prefill(
     lse: Optional[torch.Tensor] = None,
     v_scale: Optional[float] = None,
     enable_pdl: bool = False,
+    max_seqlen_kv: Optional[int] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
 ) -> None:
     """Run SM120 FP8 FMHA prefill with paged K/V cache.
 
@@ -397,6 +433,13 @@ def sm120_fmha_fp8_paged_prefill(
         Scalar multiplier folded into the normalized output. Defaults to 1.
     enable_pdl : bool
         Whether to enable Programmatic Dependent Launch.
+    max_seqlen_kv : int, optional
+        Maximum runtime K/V length. Supplying it avoids a device-to-host
+        synchronization when skip-softmax is enabled.
+    skip_softmax_threshold_scale_factor : float, optional
+        Skip a K/V tile when all rows owned by a compute warp satisfy
+        ``exp(tile_max - running_max) < scale_factor / max_seqlen_kv``.
+        ``None`` or zero selects the dense specialization.
     Raises
     ------
     RuntimeError
@@ -443,6 +486,12 @@ def sm120_fmha_fp8_paged_prefill(
     cu_seqlens_q_i32 = cu_seqlens_q.to(torch.int32)
     if max_seqlen_q is None:
         max_seqlen_q = int((cu_seqlens_q_i32[1:] - cu_seqlens_q_i32[:-1]).max().item())
+    if skip_softmax_threshold_scale_factor and max_seqlen_kv is None:
+        max_seqlen_kv = int(seqlens_kv_i32.max().item())
+    skip_threshold_log2 = _skip_softmax_threshold_log2(
+        skip_softmax_threshold_scale_factor,
+        0 if max_seqlen_kv is None else max_seqlen_kv,
+    )
     kv_tile = kv_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_KV_TILES[0]
     q_tile = q_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_Q_TILES[0]
 
@@ -477,6 +526,7 @@ def sm120_fmha_fp8_paged_prefill(
         with_lse=lse is not None,
         balanced_scheduler=_use_balanced_scheduler(is_causal),
         use_pdl=enable_pdl,
+        enable_skip_softmax=skip_threshold_log2 is not None,
     )
 
     if sm_scale is None:
@@ -499,6 +549,7 @@ def sm120_fmha_fp8_paged_prefill(
         lse,
         scale_log2,
         output_scale,
+        skip_threshold_log2,
         seqlens_kv_i32,
         cu_seqlens_q_i32,
         block_tables_i32,
@@ -523,7 +574,7 @@ class SM120PrimsBatchPrefillBackend:
         _check_cutlass_dsl_version()
         self.device = torch.device(device)
         self._mode: Optional[str] = None
-        self._compiled_variants: set[tuple[bool, bool]] = set()
+        self._compiled_variants: set[tuple[bool, bool, bool]] = set()
 
     @staticmethod
     def _scalar_scale(name: str, value: Optional[float]) -> float:
@@ -616,6 +667,7 @@ class SM120PrimsBatchPrefillBackend:
         self._qo_indptr = qo_indptr
         self._kv_indptr = kv_indptr
         self._max_seqlen_q = int(q_lens.max().item())
+        self._max_seqlen_kv = int(kv_lens.max().item())
         self._q_dtype = q_dtype
         self._kv_dtype = kv_dtype
         self._o_dtype = o_dtype
@@ -639,7 +691,7 @@ class SM120PrimsBatchPrefillBackend:
             balanced_scheduler=_use_balanced_scheduler(causal),
             use_pdl=False,
         )
-        self._compiled_variants = {(False, False)}
+        self._compiled_variants = {(False, False, False)}
 
     def plan_paged(
         self,
@@ -689,6 +741,7 @@ class SM120PrimsBatchPrefillBackend:
         self._seqlens_kv = seqlens_kv
         self._block_tables = block_tables
         self._max_seqlen_q = int(q_lens.max().item())
+        self._max_seqlen_kv = int(seqlens_kv_host.max().item())
         self._q_dtype = q_dtype
         self._kv_dtype = kv_dtype
         self._o_dtype = o_dtype
@@ -713,7 +766,7 @@ class SM120PrimsBatchPrefillBackend:
             balanced_scheduler=_use_balanced_scheduler(causal),
             use_pdl=False,
         )
-        self._compiled_variants = {(False, False)}
+        self._compiled_variants = {(False, False, False)}
 
     def _validate_run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor
@@ -749,14 +802,17 @@ class SM120PrimsBatchPrefillBackend:
                     f"{tuple(k.shape)} and {tuple(v.shape)}"
                 )
 
-    def _ensure_kernel(self, *, with_lse: bool, enable_pdl: bool) -> None:
-        variant = (with_lse, enable_pdl)
+    def _ensure_kernel(
+        self, *, with_lse: bool, enable_pdl: bool, enable_skip_softmax: bool
+    ) -> None:
+        variant = (with_lse, enable_pdl, enable_skip_softmax)
         if variant in self._compiled_variants:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "backend='cute-dsl-prims' kernel specialization "
-                f"(return_lse={with_lse}, enable_pdl={enable_pdl}) was not "
+                f"(return_lse={with_lse}, enable_pdl={enable_pdl}, "
+                f"skip_softmax={enable_skip_softmax}) was not "
                 "compiled before CUDA Graph capture; warm up the same run "
                 "configuration before capture"
             )
@@ -782,6 +838,7 @@ class SM120PrimsBatchPrefillBackend:
                 with_lse,
                 _use_balanced_scheduler(self._causal),
                 enable_pdl,
+                enable_skip_softmax,
             )
         else:
             compile_sm120_fmha_fp8_paged_kernel(
@@ -791,6 +848,7 @@ class SM120PrimsBatchPrefillBackend:
                 with_lse,
                 _use_balanced_scheduler(self._causal),
                 enable_pdl,
+                enable_skip_softmax,
             )
         self._compiled_variants.add(variant)
 
@@ -806,11 +864,22 @@ class SM120PrimsBatchPrefillBackend:
         q_scale: Optional[float],
         k_scale: Optional[float],
         v_scale: Optional[float],
+        skip_softmax_threshold_scale_factor: Optional[float],
     ) -> None:
         self._validate_run(q, k, v, out)
         if self._mode != "ragged":
             raise RuntimeError("SM120 PRIMS backend was not planned for ragged KV")
-        self._ensure_kernel(with_lse=lse is not None, enable_pdl=enable_pdl)
+        enable_skip_softmax = (
+            _skip_softmax_threshold_log2(
+                skip_softmax_threshold_scale_factor, self._max_seqlen_kv
+            )
+            is not None
+        )
+        self._ensure_kernel(
+            with_lse=lse is not None,
+            enable_pdl=enable_pdl,
+            enable_skip_softmax=enable_skip_softmax,
+        )
         sm_scale = (
             self._sm_scale
             if self._sm_scale is not None
@@ -832,6 +901,8 @@ class SM120PrimsBatchPrefillBackend:
             v_scale=scale_v,
             lse=lse,
             enable_pdl=enable_pdl,
+            max_seqlen_k=self._max_seqlen_kv,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
     def run_paged(
@@ -847,6 +918,7 @@ class SM120PrimsBatchPrefillBackend:
         q_scale: Optional[float],
         k_scale: Optional[float],
         v_scale: Optional[float],
+        skip_softmax_threshold_scale_factor: Optional[float],
     ):
         self._validate_run(q, k, v, out)
         if self._mode != "paged":
@@ -860,7 +932,17 @@ class SM120PrimsBatchPrefillBackend:
                 )
         else:
             lse = None
-        self._ensure_kernel(with_lse=return_lse, enable_pdl=enable_pdl)
+        enable_skip_softmax = (
+            _skip_softmax_threshold_log2(
+                skip_softmax_threshold_scale_factor, self._max_seqlen_kv
+            )
+            is not None
+        )
+        self._ensure_kernel(
+            with_lse=return_lse,
+            enable_pdl=enable_pdl,
+            enable_skip_softmax=enable_skip_softmax,
+        )
         sm_scale = (
             self._sm_scale
             if self._sm_scale is not None
@@ -883,6 +965,8 @@ class SM120PrimsBatchPrefillBackend:
             max_seqlen_q=self._max_seqlen_q,
             lse=lse,
             enable_pdl=enable_pdl,
+            max_seqlen_kv=self._max_seqlen_kv,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
         if return_lse:
             return out, lse
