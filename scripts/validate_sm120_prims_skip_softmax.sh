@@ -8,10 +8,24 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 required_code_commit="f764a6c868543fcf581da43b4ecef4de9b5aaa6a"
 gpu_id="${GPU_ID:-0}"
-base_python="${PYTHON_BIN:-python3}"
 validation_venv="${VALIDATION_VENV:-${repo_root}/.venv-sm120-validation}"
 result_base="${RESULT_BASE:-$(dirname "${repo_root}")/sm120-skip-results}"
 result_root="${result_base}/$(date -u +%Y%m%dT%H%M%SZ)"
+
+base_python="${PYTHON_BIN:-}"
+if [[ -z "${base_python}" ]]; then
+  for candidate in \
+    "$(dirname "${repo_root}")/minimax-h3-native/.venv/bin/python" \
+    "$(dirname "${repo_root}")/minimax-h3-native/.venv-b300/bin/python" \
+    "$(command -v python3 || true)"
+  do
+    if [[ -x "${candidate}" ]] && CUDA_VISIBLE_DEVICES="${gpu_id}" "${candidate}" -c \
+      'import torch; assert torch.cuda.is_available()' >/dev/null 2>&1; then
+      base_python="${candidate}"
+      break
+    fi
+  done
+fi
 
 mkdir -p "${result_root}"
 exec > >(tee "${result_root}/validation.log") 2>&1
@@ -19,6 +33,7 @@ exec > >(tee "${result_root}/validation.log") 2>&1
 echo "RESULT_ROOT=${result_root}"
 echo "REPO_ROOT=${repo_root}"
 echo "GPU_ID=${gpu_id}"
+echo "PYTHON_BIN=${base_python:-NOT_FOUND}"
 hostname
 date -u
 
@@ -46,10 +61,10 @@ if ((busy_count != 0)); then
   exit 3
 fi
 
-command -v "${base_python}" >/dev/null || {
-  echo "ERROR: PYTHON_BIN=${base_python} is not executable" >&2
+if [[ -z "${base_python}" || ! -x "${base_python}" ]]; then
+  echo "ERROR: no CUDA-enabled Python found; set PYTHON_BIN explicitly" >&2
   exit 2
-}
+fi
 CUDA_VISIBLE_DEVICES="${gpu_id}" "${base_python}" - <<'PY'
 import torch
 
