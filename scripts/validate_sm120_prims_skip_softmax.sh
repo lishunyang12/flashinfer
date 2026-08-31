@@ -8,7 +8,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 required_code_commit="f764a6c868543fcf581da43b4ecef4de9b5aaa6a"
 gpu_id="${GPU_ID:-0}"
-validation_venv="${VALIDATION_VENV:-${repo_root}/.venv-sm120-validation}"
+validation_overlay="${VALIDATION_OVERLAY:-$(dirname "${repo_root}")/.flashinfer-sm120-validation}"
 result_base="${RESULT_BASE:-$(dirname "${repo_root}")/sm120-skip-results}"
 result_root="${result_base}/$(date -u +%Y%m%dT%H%M%SZ)"
 
@@ -79,37 +79,41 @@ if capability != (12, 0):
     raise SystemExit(f"ERROR: expected SM120, got compute capability {capability}")
 PY
 
-if [[ ! -x "${validation_venv}/bin/python" ]]; then
-  "${base_python}" -m venv --system-site-packages "${validation_venv}"
-fi
-# shellcheck disable=SC1091
-source "${validation_venv}/bin/activate"
-python -m pip install --upgrade pytest
-
-export BUILD_NVEP=0
 export CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION:-4.7.1}"
-# setup_test_env pins the inherited CUDA stack, installs only missing runtime
-# requirements, and exposes install_flashinfer_editable.
-# shellcheck disable=SC1091
-source "${repo_root}/scripts/setup_test_env.sh"
-install_flashinfer_editable "${repo_root}"
+mkdir -p "${validation_overlay}"
+"${base_python}" -m pip install --upgrade --target "${validation_overlay}" \
+  pytest \
+  "packaging>=24.2" \
+  "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2" \
+  "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"
 
-CUDA_VISIBLE_DEVICES="${gpu_id}" python - <<'PY'
+# A venv created from another venv does not inherit its site-packages. Use a
+# target overlay instead: FlashInfer/CUTLASS come from these validation paths,
+# while Torch and the rest of the CUDA stack stay in the existing H3 env.
+validation_pythonpath="${repo_root}:${validation_overlay}${PYTHONPATH:+:${PYTHONPATH}}"
+run_python() {
+  CUDA_VISIBLE_DEVICES="${gpu_id}" PYTHONPATH="${validation_pythonpath}" \
+    "${base_python}" "$@"
+}
+
+run_python - <<'PY'
 from importlib.metadata import version
 
+import flashinfer
 import torch
 
-print("flashinfer-python=", version("flashinfer-python"))
+print("flashinfer=", flashinfer.__version__)
+print("flashinfer_module=", flashinfer.__file__)
 print("nvidia-cutlass-dsl=", version("nvidia-cutlass-dsl"))
 print("runtime_compute_capability=", torch.cuda.get_device_capability(0))
 PY
 
-CUDA_VISIBLE_DEVICES="${gpu_id}" python -m pytest -q \
+run_python -m pytest -q \
   "${repo_root}/tests/attention/test_sm120_fmha_api.py"
-CUDA_VISIBLE_DEVICES="${gpu_id}" python -m pytest -q -s \
+run_python -m pytest -q -s \
   "${repo_root}/tests/attention/test_sm120_fmha.py" \
   -k "sm120_ragged_skip_softmax_omits_negligible_tiles"
-CUDA_VISIBLE_DEVICES="${gpu_id}" python -m pytest -q -s \
+run_python -m pytest -q -s \
   "${repo_root}/tests/attention/test_sm120_prims_prefill_backend.py" \
   -k "ragged_public_wrapper_skip_softmax"
 
