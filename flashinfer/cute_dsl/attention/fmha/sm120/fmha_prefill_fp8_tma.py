@@ -954,6 +954,14 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         tile_row_max = cutlass.Array(cutlass.Float32, 2, alignment=16)
         for row_half in cutlass.range_constexpr(2):
             tile_row_max[row_half] = -cutlass.Float32.inf
+        tile_row_max_blocks = cutlass.Array(
+            cutlass.Float32,
+            (self.qk_k_frags // 4) * 2,
+            alignment=16,
+        )
+        if cutlass.const_expr(tracks_tile_row_max):
+            for i in cutlass.range_constexpr((self.qk_k_frags // 4) * 2):
+                tile_row_max_blocks[i] = -cutlass.Float32.inf
 
         k_row_in_frag_pair = (basic_params.lane_div8 // 2) * 8 + basic_params.lane_mod8
         k_col_in_frag_pair = (basic_params.lane_div8 % 2) * 16
@@ -1003,10 +1011,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         s_regs[s_off + 3],
                         self.in_dtype,
                     )
-                # On the final head-dimension fragment, reduce the preceding
-                # score block while this block's independent MMA results are
-                # still in flight. This overlaps the skip predicate's scalar
-                # work with QK instead of scanning every score afterward.
+                # Keep one max chain per score block while folding the
+                # preceding block into the final QK fragment. Independent
+                # chains shorten the predicate's critical path and overlap
+                # its scalar work with later MMA results.
                 if cutlass.const_expr(
                     tracks_tile_row_max
                     and d_frag + 1 == self.qk_d_frags
@@ -1017,12 +1025,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         previous_k_frag = previous_k_block * 4 + previous_k_in_block
                         previous_s_off = previous_k_frag * 4
                         for row_half in cutlass.range_constexpr(2):
-                            tile_row_max[row_half] = cute.arch.fmax(
-                                tile_row_max[row_half],
+                            block_max_idx = previous_k_block * 2 + row_half
+                            tile_row_max_blocks[block_max_idx] = cute.arch.fmax(
+                                tile_row_max_blocks[block_max_idx],
                                 s_regs[previous_s_off + row_half * 2],
                             )
-                            tile_row_max[row_half] = cute.arch.fmax(
-                                tile_row_max[row_half],
+                            tile_row_max_blocks[block_max_idx] = cute.arch.fmax(
+                                tile_row_max_blocks[block_max_idx],
                                 s_regs[previous_s_off + row_half * 2 + 1],
                             )
                 if cutlass.const_expr(
@@ -1034,15 +1043,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             0,
                             k_pair,
                         )
-                if cutlass.const_expr(d_frag + 1 < self.qk_d_frags):
-                    for pair_in_block in cutlass.range_constexpr(2):
-                        k_pair = k_block * 2 + pair_in_block
-                        k_next[k_pair * 2], k_next[k_pair * 2 + 1] = (
-                            load_k_fragment_pair(
-                                d_next,
-                                k_pair,
-                            )
-                        )
+                for pair_in_block in cutlass.range_constexpr(2):
+                    k_pair = k_block * 2 + pair_in_block
+                    k_next[k_pair * 2], k_next[k_pair * 2 + 1] = load_k_fragment_pair(
+                        d_next,
+                        k_pair,
+                    )
             if cutlass.const_expr(
                 tracks_tile_row_max and d_frag + 1 == self.qk_d_frags
             ):
@@ -1051,15 +1057,36 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     last_k_frag = last_k_block * 4 + last_k_in_block
                     last_s_off = last_k_frag * 4
                     for row_half in cutlass.range_constexpr(2):
-                        tile_row_max[row_half] = cute.arch.fmax(
-                            tile_row_max[row_half],
+                        block_max_idx = last_k_block * 2 + row_half
+                        tile_row_max_blocks[block_max_idx] = cute.arch.fmax(
+                            tile_row_max_blocks[block_max_idx],
                             s_regs[last_s_off + row_half * 2],
                         )
-                        tile_row_max[row_half] = cute.arch.fmax(
-                            tile_row_max[row_half],
+                        tile_row_max_blocks[block_max_idx] = cute.arch.fmax(
+                            tile_row_max_blocks[block_max_idx],
                             s_regs[last_s_off + row_half * 2 + 1],
                         )
             k_cur = k_next
+
+        if cutlass.const_expr(tracks_tile_row_max):
+            for row_half in cutlass.range_constexpr(2):
+                for k_block_pair in cutlass.range_constexpr(self.qk_k_frags // 8):
+                    first_k_block = k_block_pair * 2
+                    first_max_idx = first_k_block * 2 + row_half
+                    second_max_idx = first_max_idx + 2
+                    tile_row_max_blocks[first_max_idx] = cute.arch.fmax(
+                        tile_row_max_blocks[first_max_idx],
+                        tile_row_max_blocks[second_max_idx],
+                    )
+                tile_row_max[row_half] = tile_row_max_blocks[row_half]
+                for k_block_pair in cutlass.range_constexpr(
+                    1,
+                    self.qk_k_frags // 8,
+                ):
+                    tile_row_max[row_half] = cute.arch.fmax(
+                        tile_row_max[row_half],
+                        tile_row_max_blocks[k_block_pair * 4 + row_half],
+                    )
 
         return s_regs, tile_row_max
 
