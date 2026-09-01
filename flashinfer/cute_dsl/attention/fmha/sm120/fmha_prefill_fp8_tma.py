@@ -945,11 +945,15 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         basic_params: SimpleNamespace,
         mma_params: SimpleNamespace,
         q_regs: cutlass.Array,
-    ) -> cutlass.Array:
-        """Original fixed-K QK path for the two-buffer specialization."""
+        tracks_tile_row_max: cutlass.Constexpr[bool],
+    ) -> tuple:
+        """Fixed-K QK path, optionally folding in the skip row-max scan."""
         s_regs = cutlass.Array(cutlass.Float32, self.qk_k_frags * 4, alignment=16)
         for i in cutlass.range_constexpr(self.qk_k_frags * 4):
             s_regs[i] = cutlass.Float32(0.0)
+        tile_row_max = cutlass.Array(cutlass.Float32, 2, alignment=16)
+        for row_half in cutlass.range_constexpr(2):
+            tile_row_max[row_half] = -cutlass.Float32.inf
 
         k_row_in_frag_pair = (basic_params.lane_div8 // 2) * 8 + basic_params.lane_mod8
         k_col_in_frag_pair = (basic_params.lane_div8 % 2) * 16
@@ -999,6 +1003,28 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         s_regs[s_off + 3],
                         self.in_dtype,
                     )
+                # On the final head-dimension fragment, reduce the preceding
+                # score block while this block's independent MMA results are
+                # still in flight. This overlaps the skip predicate's scalar
+                # work with QK instead of scanning every score afterward.
+                if cutlass.const_expr(
+                    tracks_tile_row_max
+                    and d_frag + 1 == self.qk_d_frags
+                    and k_block > 0
+                ):
+                    previous_k_block = k_block - 1
+                    for previous_k_in_block in cutlass.range_constexpr(4):
+                        previous_k_frag = previous_k_block * 4 + previous_k_in_block
+                        previous_s_off = previous_k_frag * 4
+                        for row_half in cutlass.range_constexpr(2):
+                            tile_row_max[row_half] = cute.arch.fmax(
+                                tile_row_max[row_half],
+                                s_regs[previous_s_off + row_half * 2],
+                            )
+                            tile_row_max[row_half] = cute.arch.fmax(
+                                tile_row_max[row_half],
+                                s_regs[previous_s_off + row_half * 2 + 1],
+                            )
                 if cutlass.const_expr(
                     d_frag == 0 and k_block + 1 < self.qk_k_frags // 4
                 ):
@@ -1014,9 +1040,25 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         d_next,
                         k_pair,
                     )
+            if cutlass.const_expr(
+                tracks_tile_row_max and d_frag + 1 == self.qk_d_frags
+            ):
+                last_k_block = self.qk_k_frags // 4 - 1
+                for last_k_in_block in cutlass.range_constexpr(4):
+                    last_k_frag = last_k_block * 4 + last_k_in_block
+                    last_s_off = last_k_frag * 4
+                    for row_half in cutlass.range_constexpr(2):
+                        tile_row_max[row_half] = cute.arch.fmax(
+                            tile_row_max[row_half],
+                            s_regs[last_s_off + row_half * 2],
+                        )
+                        tile_row_max[row_half] = cute.arch.fmax(
+                            tile_row_max[row_half],
+                            s_regs[last_s_off + row_half * 2 + 1],
+                        )
             k_cur = k_next
 
-        return s_regs
+        return s_regs, tile_row_max
 
     @cute.jit
     def online_softmax(
@@ -1875,6 +1917,38 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         return cute.arch.vote_all_sync(thread_wants_skip)
 
     @cute.jit
+    def should_skip_softmax_from_tile_row_max(
+        self,
+        basic_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        tile_row_max: cutlass.Array,
+    ) -> cutlass.Boolean:
+        """Evaluate the hot-loop skip predicate from QK-folded row maxima."""
+        thread_wants_skip = cutlass.Boolean(True)
+        for row_half in cutlass.range_constexpr(2):
+            q_row_in_cta = (
+                basic_params.q_warp_row0 + basic_params.lane_div4 + row_half * 8
+            )
+            q_row_is_valid = (
+                basic_params.q_seq_idx + q_row_in_cta < basic_params.seqlen_q
+            )
+            reduced_tile_row_max = nvvm_threadquad_reduction_max_full(
+                tile_row_max[row_half]
+            )
+            row_wants_skip = cutlass.Boolean(False)
+            if not q_row_is_valid or reduced_tile_row_max == -cutlass.Float32.inf:
+                row_wants_skip = cutlass.Boolean(True)
+            elif softmax_params.row_max[row_half] != -cutlass.Float32.inf:
+                row_wants_skip = (
+                    (reduced_tile_row_max - softmax_params.row_max[row_half])
+                    * softmax_params.softmax_scale_log2
+                    < softmax_params.skip_softmax_threshold_log2
+                )
+            thread_wants_skip = thread_wants_skip and row_wants_skip
+
+        return cute.arch.vote_all_sync(thread_wants_skip)
+
+    @cute.jit
     def compute_one_kv_tile(
         self,
         basic_params: SimpleNamespace,
@@ -2003,7 +2077,18 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         ):
             pass
 
-        s_regs = self.mma_qk_single_buffer(basic_params, mma_params, q_regs)
+        enable_skip_softmax = softmax_params.skip_softmax_threshold_log2 is not None
+        tracks_tile_row_max = cutlass.const_expr(
+            enable_skip_softmax
+            and not uses_softmax_init_path
+            and not is_masked_frontier_tile
+        )
+        s_regs, tile_row_max = self.mma_qk_single_buffer(
+            basic_params,
+            mma_params,
+            q_regs,
+            tracks_tile_row_max,
+        )
         if prims.elect_sync():
             prims.mbarrier_arrive(
                 basic_params.mbar_k_consumed,
@@ -2011,17 +2096,23 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             )
 
         kv_seq_idx = kv_tile_idx * self.kv_tile
-        enable_skip_softmax = softmax_params.skip_softmax_threshold_log2 is not None
         skip_softmax = cutlass.Boolean(False)
         if cutlass.const_expr(enable_skip_softmax and not uses_softmax_init_path):
-            skip_softmax = self.should_skip_softmax(
-                basic_params,
-                softmax_params,
-                s_regs,
-                cutlass.Float32(0.0),
-                kv_seq_idx,
-                is_masked_frontier_tile,
-            )
+            if cutlass.const_expr(tracks_tile_row_max):
+                skip_softmax = self.should_skip_softmax_from_tile_row_max(
+                    basic_params,
+                    softmax_params,
+                    tile_row_max,
+                )
+            else:
+                skip_softmax = self.should_skip_softmax(
+                    basic_params,
+                    softmax_params,
+                    s_regs,
+                    cutlass.Float32(0.0),
+                    kv_seq_idx,
+                    is_masked_frontier_tile,
+                )
 
         while not prims.mbarrier_try_wait_parity(
             basic_params.mbar_v_arrived, tma_phase, time_limit=10_000_000
