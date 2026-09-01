@@ -618,9 +618,17 @@ the skip specialization with no tiles omitted, and a skip-friendly input:
 
 ```bash
 python benchmarks/bench_sm120_skip_softmax.py \
+  --preset custom \
   --batch-size 1 --q-len 256 --kv-len 4096 \
   --num-q-heads 32 --num-kv-heads 8 --head-dim 128 \
   --skip-scale-factor 1 --warmup 20 --repeat 100
+```
+
+Capture one steady-state 64K MiniMax H3-shaped kernel per mode with Nsight
+Compute, then emit a compact dense/no-skip/active-skip comparison:
+
+```bash
+GPU_ID=0 bash scripts/profile_sm120_skip_softmax_ncu.sh
 ```
 - moe_a2a: MoE All-to-All communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
 - allreduce: AllReduce fusion communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
