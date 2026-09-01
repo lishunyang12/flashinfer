@@ -334,8 +334,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     # Barrier 0 is the CTA-wide initialization barrier; barrier 1 synchronizes
     # compute warps before the K/V storage is aliased for the output epilogue.
     COMPUTE_BARRIER_ID = 1
-    # K and V operands share a three-slot circular TMA pipeline. D256 uses
-    # 96 KiB for these slots, which fits the SM120 shared-memory capacity.
+    # K and V operands share a three-slot circular TMA pipeline for the
+    # Q128/KV128 fast paths. D128 and D256 use 48 KiB and 96 KiB respectively,
+    # both within the SM120 shared-memory capacity.
     KV_PIPELINE_STAGES = 3
 
     def __init__(
@@ -389,7 +390,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         self.q_tile = q_tile
         self.kv_tile = kv_tile
         self.kv_pipeline_stages = (
-            3 if head_tile == 256 and q_tile == 128 and kv_tile == 128 else 2
+            3
+            if head_tile in (128, 256) and q_tile == 128 and kv_tile == 128
+            else 2
         )
         if self.use_paged_kv:
             if num_tokens_per_page not in self.SUPPORTED_PAGE_SIZES:
@@ -557,7 +560,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             return False
 
         kv_pipeline_stages = (
-            3 if head_dim == 256 and q_tile == 128 and kv_tile == 128 else 2
+            3
+            if head_dim in (128, 256) and q_tile == 128 and kv_tile == 128
+            else 2
         )
         kv_smem_bytes = kv_pipeline_stages * kv_tile * head_dim * in_dtype.bytes
         output_bytes = q_tile * head_dim * out_dtype.bytes
@@ -943,11 +948,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     def mma_qk_single_buffer(
         self,
         basic_params: SimpleNamespace,
-        mma_params: SimpleNamespace,
         q_regs: cutlass.Array,
+        sK: cutlass.Pointer,
         tracks_tile_row_max: cutlass.Constexpr[bool],
     ) -> tuple:
-        """Fixed-K QK path, optionally folding in the skip row-max scan."""
+        """Direct-row-state QK path, optionally folding in the row-max scan."""
         s_regs = cutlass.Array(cutlass.Float32, self.qk_k_frags * 4, alignment=16)
         for i in cutlass.range_constexpr(self.qk_k_frags * 4):
             s_regs[i] = cutlass.Float32(0.0)
@@ -967,7 +972,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             k_chunk = k_col // self.tma_copy_head_per_iter
             k_col_in_chunk = k_col % self.tma_copy_head_per_iter
             sK_ptr = (
-                mma_params.sK.data_ptr()
+                sK
                 + k_chunk * self.tma_copy_elems_per_iter
                 + k_row * self.tma_copy_head_per_iter
                 + self._get_swizzled_col(k_row, k_col_in_chunk)
@@ -1293,6 +1298,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         basic_params: SimpleNamespace,
         mma_params: SimpleNamespace,
         softmax_params: SimpleNamespace,
+        sV: cutlass.Pointer,
         s_regs: cutlass.Array,
         tile_row_max: cutlass.Array,
         kv_seq_idx: cutlass.Int32,
@@ -1300,7 +1306,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         uses_softmax_init_path: cutlass.Constexpr[bool],
         uses_precomputed_tile_row_max: cutlass.Constexpr[bool],
     ) -> tuple:
-        """Original direct row-state softmax for the two-buffer path."""
+        """Direct-row-state softmax with an explicit V-stage pointer."""
         o_regs = mma_params.o_regs
         row_max = softmax_params.row_max
         row_sum = softmax_params.row_sum
@@ -1443,7 +1449,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 # scalar softmax work available to hide the shared-memory load.
                 v_initial = self.load_v_initial_fragments_single_buffer(
                     basic_params,
-                    mma_params,
+                    sV,
                 )
 
         return p_regs, v_initial
@@ -1612,9 +1618,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     def load_v_initial_fragments_single_buffer(
         self,
         basic_params: SimpleNamespace,
-        mma_params: SimpleNamespace,
+        sV: cutlass.Pointer,
     ) -> cutlass.Array:
-        """Load the first BMM2 V fragment set before online softmax."""
+        """Load the first BMM2 V fragment set from the selected pipeline stage."""
         v_regs = cutlass.Array(cutlass.Int32, self.pv_d_frags * 2, alignment=16)
         v_lane = basic_params.lane
         uses_direct_p_pack = cutlass.const_expr(
@@ -1646,7 +1652,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             v_chunk = v_col // self.tma_copy_head_per_iter
             v_col_in_chunk = v_col % self.tma_copy_head_per_iter
             sV_ptr = (
-                mma_params.sV.data_ptr()
+                sV
                 + v_chunk * self.tma_copy_elems_per_iter
                 + v_row * self.tma_copy_head_per_iter
                 + self._get_swizzled_col(v_row, v_col_in_chunk)
@@ -1670,6 +1676,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         self,
         basic_params: SimpleNamespace,
         mma_params: SimpleNamespace,
+        sV: cutlass.Pointer,
         p_regs: cutlass.Array,
         v_initial: cutlass.Array,
     ) -> None:
@@ -1705,7 +1712,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             v_chunk = v_col // self.tma_copy_head_per_iter
             v_col_in_chunk = v_col % self.tma_copy_head_per_iter
             sV_ptr = (
-                mma_params.sV.data_ptr()
+                sV
                 + v_chunk * self.tma_copy_elems_per_iter
                 + v_row * self.tma_copy_head_per_iter
                 + self._get_swizzled_col(v_row, v_col_in_chunk)
@@ -2064,7 +2071,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         return row_state
 
     @cute.jit
-    def compute_one_kv_tile_single_buffer(
+    def compute_one_kv_tile_direct_state(
         self,
         basic_params: SimpleNamespace,
         mma_params: SimpleNamespace,
@@ -2072,15 +2079,36 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         q_regs: cutlass.Array,
         num_kv_tiles: cutlass.Int32,
         kv_tile_idx: cutlass.Int32,
+        k_stage: cutlass.Int32,
+        uses_kv_ring: cutlass.Constexpr[bool],
         is_masked_frontier_tile: cutlass.Constexpr[bool],
         uses_softmax_init_path: cutlass.Constexpr[bool],
     ) -> None:
-        """Original independent fixed-buffer K/V compute iteration."""
-        tma_phase = (num_kv_tiles - 1 - kv_tile_idx) & cutlass.Int32(1)
-        while not prims.mbarrier_try_wait_parity(
-            basic_params.mbar_k_arrived, tma_phase, time_limit=10_000_000
-        ):
-            pass
+        """One direct-row-state QK/skip/softmax/PV iteration."""
+        if cutlass.const_expr(uses_kv_ring):
+            k_phase = k_stage & cutlass.Int32(1)
+            v_stage = k_stage + cutlass.Int32(1)
+            if v_stage == self.kv_pipeline_stages:
+                v_stage = cutlass.Int32(0)
+            v_phase = (k_stage + cutlass.Int32(1)) // cutlass.Int32(2)
+            sK = self.get_kv_stage_ptr(mma_params.sKV, k_stage)
+            k_arrived = self.get_mbar_stage_ptr(basic_params.mbar_arrived, k_stage)
+            k_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, k_stage)
+            sV = self.get_kv_stage_ptr(mma_params.sKV, v_stage)
+            v_arrived = self.get_mbar_stage_ptr(basic_params.mbar_arrived, v_stage)
+            v_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, v_stage)
+        else:
+            tma_phase = (num_kv_tiles - 1 - kv_tile_idx) & cutlass.Int32(1)
+            k_phase = tma_phase
+            v_phase = tma_phase
+            sK = mma_params.sK.data_ptr()
+            k_arrived = basic_params.mbar_k_arrived
+            k_consumed = basic_params.mbar_k_consumed
+            sV = mma_params.sV.data_ptr()
+            v_arrived = basic_params.mbar_v_arrived
+            v_consumed = basic_params.mbar_v_consumed
+
+        self.wait_pipeline_barrier(k_arrived, k_phase)
 
         enable_skip_softmax = softmax_params.skip_softmax_threshold_log2 is not None
         tracks_tile_row_max = cutlass.const_expr(
@@ -2090,13 +2118,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         )
         s_regs, tile_row_max = self.mma_qk_single_buffer(
             basic_params,
-            mma_params,
             q_regs,
+            sK,
             tracks_tile_row_max,
         )
         if prims.elect_sync():
             prims.mbarrier_arrive(
-                basic_params.mbar_k_consumed,
+                k_consumed,
                 count=cute.arch.WARP_SIZE,
             )
 
@@ -2119,10 +2147,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     is_masked_frontier_tile,
                 )
 
-        while not prims.mbarrier_try_wait_parity(
-            basic_params.mbar_v_arrived, tma_phase, time_limit=10_000_000
-        ):
-            pass
+        self.wait_pipeline_barrier(v_arrived, v_phase)
 
         if cutlass.const_expr(enable_skip_softmax):
             if not skip_softmax:
@@ -2130,6 +2155,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     basic_params,
                     mma_params,
                     softmax_params,
+                    sV,
                     s_regs,
                     tile_row_max,
                     kv_seq_idx,
@@ -2140,6 +2166,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 self.mma_pv_single_buffer_preloaded(
                     basic_params,
                     mma_params,
+                    sV,
                     p_regs,
                     v_initial,
                 )
@@ -2148,6 +2175,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 basic_params,
                 mma_params,
                 softmax_params,
+                sV,
                 s_regs,
                 tile_row_max,
                 kv_seq_idx,
@@ -2158,12 +2186,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             self.mma_pv_single_buffer_preloaded(
                 basic_params,
                 mma_params,
+                sV,
                 p_regs,
                 v_initial,
             )
         if prims.elect_sync():
             prims.mbarrier_arrive(
-                basic_params.mbar_v_consumed,
+                v_consumed,
                 count=cute.arch.WARP_SIZE,
             )
 
@@ -2317,7 +2346,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
 
             uses_three_stage_pipeline = cutlass.const_expr(
-                self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
+                self.head_tile in (128, 256)
+                and self.q_tile == 128
+                and self.kv_tile == 128
             )
             uses_kv_l2_policy = cutlass.const_expr(
                 self.head_tile in (128, 256)
@@ -2539,7 +2570,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             uses_distributed_row_state = cutlass.const_expr(
                 self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
             )
-            uses_unified_kv_ring = uses_distributed_row_state
+            uses_direct_state_ring = cutlass.const_expr(
+                self.head_tile == 128 and self.q_tile == 128 and self.kv_tile == 128
+            )
+            uses_unified_kv_ring = cutlass.const_expr(
+                uses_distributed_row_state or uses_direct_state_ring
+            )
             if cutlass.const_expr(uses_distributed_row_state):
                 # D256/Q128/KV128 crosses the register cliff with four state
                 # scalars. Distribute them across each threadquad: lanes 0/1
@@ -2593,14 +2629,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 mbar_k_consumed=mbar_consumed,
                 mbar_v_consumed=mbar_consumed.subview(1),
             )
-            if cutlass.const_expr(uses_distributed_row_state):
+            if cutlass.const_expr(
+                uses_distributed_row_state or uses_direct_state_ring
+            ):
                 mma_params = SimpleNamespace(
                     sKV=sKV,
                     o_regs=o_regs,
-                )
-                softmax_params = SimpleNamespace(
-                    softmax_scale_log2=softmax_scale_log2,
-                    skip_softmax_threshold_log2=skip_softmax_threshold_log2,
                 )
             else:
                 mma_params = SimpleNamespace(
@@ -2609,6 +2643,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     sV=sKV.subview(self.kv_tile_elems),
                     o_regs=o_regs,
                 )
+
+            if cutlass.const_expr(uses_distributed_row_state):
+                softmax_params = SimpleNamespace(
+                    softmax_scale_log2=softmax_scale_log2,
+                    skip_softmax_threshold_log2=skip_softmax_threshold_log2,
+                )
+            else:
                 softmax_params = SimpleNamespace(
                     row_max=row_max,
                     row_sum=row_sum,
@@ -2648,19 +2689,34 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             is_masked_frontier_tile=True,
                             uses_softmax_init_path=(step == 0),
                         )
-                    else:
-                        self.compute_one_kv_tile_single_buffer(
+                    elif cutlass.const_expr(uses_direct_state_ring):
+                        self.compute_one_kv_tile_direct_state(
                             basic_params,
                             mma_params,
                             softmax_params,
                             q_regs,
                             num_kv_tiles,
                             kv_tile_idx,
+                            pipeline_k_stage,
+                            uses_kv_ring=True,
+                            is_masked_frontier_tile=True,
+                            uses_softmax_init_path=(step == 0),
+                        )
+                    else:
+                        self.compute_one_kv_tile_direct_state(
+                            basic_params,
+                            mma_params,
+                            softmax_params,
+                            q_regs,
+                            num_kv_tiles,
+                            kv_tile_idx,
+                            pipeline_k_stage,
+                            uses_kv_ring=False,
                             is_masked_frontier_tile=True,
                             uses_softmax_init_path=(step == 0),
                         )
                 kv_tile_idx -= 1
-                if cutlass.const_expr(uses_distributed_row_state):
+                if cutlass.const_expr(uses_unified_kv_ring):
                     if pipeline_k_stage == 0:
                         pipeline_k_stage = cutlass.Int32(2)
                     else:
@@ -2669,25 +2725,41 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             # Phase 2: remaining tiles outside the explicit mask frontier.
             while kv_tile_idx >= 0:
                 if cutlass.const_expr(uses_unified_kv_ring):
-                    row_state = self.compute_one_kv_tile(
-                        basic_params,
-                        mma_params,
-                        softmax_params,
-                        q_regs,
-                        row_state,
-                        kv_tile_idx,
-                        pipeline_k_stage,
-                        is_masked_frontier_tile=False,
-                        uses_softmax_init_path=False,
-                    )
+                    if cutlass.const_expr(uses_distributed_row_state):
+                        row_state = self.compute_one_kv_tile(
+                            basic_params,
+                            mma_params,
+                            softmax_params,
+                            q_regs,
+                            row_state,
+                            kv_tile_idx,
+                            pipeline_k_stage,
+                            is_masked_frontier_tile=False,
+                            uses_softmax_init_path=False,
+                        )
+                    else:
+                        self.compute_one_kv_tile_direct_state(
+                            basic_params,
+                            mma_params,
+                            softmax_params,
+                            q_regs,
+                            num_kv_tiles,
+                            kv_tile_idx,
+                            pipeline_k_stage,
+                            uses_kv_ring=True,
+                            is_masked_frontier_tile=False,
+                            uses_softmax_init_path=False,
+                        )
                 else:
-                    self.compute_one_kv_tile_single_buffer(
+                    self.compute_one_kv_tile_direct_state(
                         basic_params,
                         mma_params,
                         softmax_params,
                         q_regs,
                         num_kv_tiles,
                         kv_tile_idx,
+                        pipeline_k_stage,
+                        uses_kv_ring=False,
                         is_masked_frontier_tile=False,
                         uses_softmax_init_path=False,
                     )
