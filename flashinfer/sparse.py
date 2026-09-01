@@ -250,10 +250,17 @@ def _vsa_run_core(
     out: Optional[torch.Tensor],
     lse: Optional[torch.Tensor],
     return_lse: bool,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
 ):
     """Shared NHD→BSHD dispatch, kernel call, and BSHD→NHD reshape for all VSA backends."""
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
+
+    fwd_kwargs = {}
+    if skip_softmax_threshold_scale_factor is not None:
+        fwd_kwargs["skip_softmax_threshold_scale_factor"] = (
+            skip_softmax_threshold_scale_factor
+        )
 
     o_bsa, lse_bsa = fwd_fn(
         q.unsqueeze(0).contiguous(),
@@ -265,6 +272,7 @@ def _vsa_run_core(
         q2k_block_nums=vsa_q2k_num,
         softmax_scale=sm_scale,
         return_lse=True,
+        **fwd_kwargs,
     )
 
     output = o_bsa[0]  # [1, M, H, D] -> [M, H, D]
@@ -1058,6 +1066,7 @@ class BlockSparseAttentionWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute block-sparse attention between Q/K/V tensors.
 
@@ -1087,6 +1096,10 @@ class BlockSparseAttentionWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        skip_softmax_threshold_scale_factor : float, optional
+            SM120 native BF16/FP16 skip-softmax threshold scale factor. The
+            effective threshold is ``scale_factor / N``. None or zero disables
+            skip-softmax. Only supported by ``vsa_sm120_blk64``.
 
         Returns
         -------
@@ -1099,6 +1112,15 @@ class BlockSparseAttentionWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+
+        if (
+            skip_softmax_threshold_scale_factor not in (None, 0)
+            and self._backend != "vsa_sm120_blk64"
+        ):
+            raise ValueError(
+                "skip_softmax_threshold_scale_factor is only supported by "
+                "the vsa_sm120_blk64 backend"
+            )
 
         if self._backend == "cake":
             from flashinfer.cake_vsa import run_cake_vsa
@@ -1173,6 +1195,7 @@ class BlockSparseAttentionWrapper:
                 out,
                 lse,
                 return_lse,
+                skip_softmax_threshold_scale_factor,
             )
 
         pos_encoding_mode = self._pos_encoding_mode

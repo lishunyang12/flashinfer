@@ -529,6 +529,75 @@ def test_vsa_sm120_variable_blocks_per_q(workspace):
 
 
 # ---------------------------------------------------------------------------
+# Skip-softmax
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_vsa_sm120_skip_softmax(dtype, workspace):
+    """Native SM120 skip-softmax must preserve dense attention accuracy."""
+    device = torch.device("cuda")
+    torch.manual_seed(41)
+    num_heads, num_blocks = 4, 8
+    M = N = num_blocks * R
+
+    q = torch.ones(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.zeros(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    k[-R:].fill_(1)
+    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+
+    indptr = torch.arange(
+        0,
+        (num_blocks + 1) * num_blocks,
+        num_blocks,
+        dtype=torch.int32,
+        device=device,
+    )
+    indices = torch.arange(num_blocks, dtype=torch.int32, device=device).repeat(
+        num_blocks
+    )
+
+    wrapper = _make_wrapper(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
+        q_data_type=dtype,
+    )
+    dense, dense_lse = wrapper.run(q, k, v, return_lse=True)
+    no_skip, no_skip_lse = wrapper.run(
+        q,
+        k,
+        v,
+        return_lse=True,
+        skip_softmax_threshold_scale_factor=1e-30,
+    )
+    skipped, skipped_lse = wrapper.run(
+        q,
+        k,
+        v,
+        return_lse=True,
+        skip_softmax_threshold_scale_factor=1.0,
+    )
+
+    torch.testing.assert_close(dense, no_skip, atol=0, rtol=0)
+    torch.testing.assert_close(dense_lse, no_skip_lse, atol=0, rtol=0)
+    torch.testing.assert_close(dense, skipped, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dense_lse, skipped_lse, atol=1e-2, rtol=1e-2)
+
+    with pytest.raises(
+        ValueError, match="skip_softmax_threshold_scale_factor must be finite"
+    ):
+        wrapper.run(q, k, v, skip_softmax_threshold_scale_factor=-1.0)
+
+
+# ---------------------------------------------------------------------------
 # Performance sweep (opt-in)
 # ---------------------------------------------------------------------------
 

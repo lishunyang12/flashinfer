@@ -630,6 +630,14 @@ Compute, then emit a compact dense/no-skip/active-skip comparison:
 ```bash
 GPU_ID=0 bash scripts/profile_sm120_skip_softmax_ncu.sh
 ```
+
+On SM120, validate the native BF16 `vsa_sm120_blk64` warp-MMA path and
+compare its dense, no-tile-skipped, and active skip-softmax specializations:
+
+```bash
+GPU_ID=0 bash scripts/probe_sm120_bf16_skip_softmax.sh
+```
+
 - moe_a2a: MoE All-to-All communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
 - allreduce: AllReduce fusion communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
 - triton: Triton reference kernels (used for Mamba selective_state_update and GDN decode/MTP)

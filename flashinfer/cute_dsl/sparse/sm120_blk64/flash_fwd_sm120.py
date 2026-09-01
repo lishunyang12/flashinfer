@@ -105,6 +105,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         V_smem_layout: cute.ComposedLayout,
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
+        skip_softmax_threshold_log2: cutlass.Float32 | None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
@@ -428,26 +429,53 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
             if varblk < self.tile_size:
                 mask(tSrS, tScS, varblk)
-            row_scale = online_softmax(tSrS, max_m, sum_m, scale_softmax_log2e)
+
+            enable_skip_softmax = skip_softmax_threshold_log2 is not None
+            skip_softmax = cutlass.Boolean(False)
+            if cutlass.const_expr(enable_skip_softmax):
+                skip_softmax = should_skip_softmax(
+                    tSrS,
+                    max_m,
+                    scale_softmax_log2e,
+                    skip_softmax_threshold_log2,
+                )
 
             # Compute P @ V.
-            rescale_o_for_next_acc(tOrO, row_scale)
             tOrP_frg = cute.make_rmem_tensor_like(tSrS, self.K_dtype)
-            tOrP_frg.store(tSrS.load().to(self.K_dtype))
             tOrP = layout_utils.reshape_acc_to_frgA(tOrP_frg)
+            if cutlass.const_expr(enable_skip_softmax):
+                if not skip_softmax:
+                    row_scale = online_softmax(tSrS, max_m, sum_m, scale_softmax_log2e)
+                    rescale_o_for_next_acc(tOrO, row_scale)
+                    tOrP_frg.store(tSrS.load().to(self.K_dtype))
+            else:
+                row_scale = online_softmax(tSrS, max_m, sum_m, scale_softmax_log2e)
+                rescale_o_for_next_acc(tOrO, row_scale)
+                tOrP_frg.store(tSrS.load().to(self.K_dtype))
 
             V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
             V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
 
             v_stage = V_consumer_state.index
-            gemm_rs_smem(
-                tiled_mma_pv,
-                tOrO,
-                tOrP,
-                tOrV,
-                tOsV_copy[None, None, None, v_stage],
-                smem_tiled_copy_V,
-            )
+            if cutlass.const_expr(enable_skip_softmax):
+                if not skip_softmax:
+                    gemm_rs_smem(
+                        tiled_mma_pv,
+                        tOrO,
+                        tOrP,
+                        tOrV,
+                        tOsV_copy[None, None, None, v_stage],
+                        smem_tiled_copy_V,
+                    )
+            else:
+                gemm_rs_smem(
+                    tiled_mma_pv,
+                    tOrO,
+                    tOrP,
+                    tOrV,
+                    tOsV_copy[None, None, None, v_stage],
+                    smem_tiled_copy_V,
+                )
 
             V_pipeline.consumer_release(V_consumer_state)
             V_consumer_state.advance()
@@ -523,6 +551,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         block_sparse_num: cutlass.Int32,
         blocksparse_varblk: cute.Tensor,
         softmax_scale: cutlass.Float32,
+        skip_softmax_threshold_log2: cutlass.Float32 | None,
         stream: cuda.CUstream,
     ):
         # Restore compile-time head dimensions while keeping runtime tensor modes dynamic.
@@ -699,6 +728,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             self.V_smem_layout,
             self.O_smem_layout,
             softmax_scale * log2_e,
+            skip_softmax_threshold_log2,
         ).launch(
             grid=grid_config,
             block=block_config,
@@ -782,6 +812,33 @@ def mask(
         should_mask = tScS_mn[0, n][1] >= varblk
         for m in cutlass.range(cute.size(tSrS_mn, mode=[0]), unroll_full=True):
             tSrS_mn[m, n] = -cutlass.Float32.inf if should_mask else tSrS_mn[m, n]
+
+
+@cute.jit
+def should_skip_softmax(
+    tSrS: cute.ThrMma,
+    row_max: cute.Tensor,
+    softmax_scale_log2e: cutlass.Float32,
+    skip_softmax_threshold_log2: cutlass.Float32,
+) -> cutlass.Boolean:
+    """Return a warp-uniform decision for the rows owned by this warp."""
+    tSrS_mn = layout_utils.reshape_acc_to_mn(tSrS)
+    thread_wants_skip = cutlass.Boolean(True)
+
+    for m in cutlass.range(cute.size(row_max), unroll_full=True):
+        tile_row_max = kernel_utils.fmax_reduce(
+            tSrS_mn[m, None].load(),
+            arch=80,
+        )
+        tile_row_max = cute.arch.warp_reduction_max(tile_row_max, threads_in_group=4)
+        row_wants_skip = cutlass.Boolean(False)
+        if row_max[m] != -cutlass.Float32.inf:
+            row_wants_skip = (
+                tile_row_max - row_max[m]
+            ) * softmax_scale_log2e < skip_softmax_threshold_log2
+        thread_wants_skip = thread_wants_skip and row_wants_skip
+
+    return cute.arch.vote_all_sync(thread_wants_skip)
 
 
 @cute.jit
