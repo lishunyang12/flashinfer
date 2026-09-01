@@ -69,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-q-heads", type=int, default=32)
     parser.add_argument("--num-kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--q-tile", type=int, choices=(64, 128), default=128)
+    parser.add_argument("--kv-tile", type=int, choices=(64, 128), default=128)
     parser.add_argument("--skip-scale-factor", type=float, default=1.0)
     parser.add_argument(
         "--active-skip-fraction",
@@ -148,6 +150,8 @@ def benchmark_case(
     *,
     skip_scale_factor: float,
     active_skip_fraction: float | None,
+    q_tile: int,
+    kv_tile: int,
     warmup: int,
     repeat: int,
     seed: int,
@@ -165,7 +169,7 @@ def benchmark_case(
     k = torch.zeros(
         total_kv, case.num_kv_heads, case.head_dim, device=device, dtype=fp8
     )
-    complete_kv_tiles = case.kv_len // 128
+    complete_kv_tiles = case.kv_len // kv_tile
     if active_skip_fraction is None:
         negligible_tiles = max(complete_kv_tiles - 1, 0)
     else:
@@ -173,7 +177,7 @@ def benchmark_case(
             int(complete_kv_tiles * active_skip_fraction),
             max(complete_kv_tiles - 1, 0),
         )
-    negligible_tokens = negligible_tiles * 128
+    negligible_tokens = negligible_tiles * kv_tile
     dominant_tokens = case.kv_len - negligible_tokens
     realized_skip_fraction = (
         negligible_tiles / complete_kv_tiles if complete_kv_tiles else 0.0
@@ -194,20 +198,8 @@ def benchmark_case(
     kv_indptr = torch.arange(
         case.batch_size + 1, device=device, dtype=torch.int32
     ).mul_(case.kv_len)
-    workspace = torch.empty(64 << 20, device=device, dtype=torch.uint8)
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace, "NHD", backend="cute-dsl-prims"
-    )
-    wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        case.num_q_heads,
-        case.num_kv_heads,
-        case.head_dim,
-        causal=False,
-        q_data_type=fp8,
-        kv_data_type=fp8,
-        o_data_type=torch.bfloat16,
+    from flashinfer.attention.cute_dsl.sm120_fmha import (
+        sm120_fmha_fp8_ragged_prefill,
     )
 
     outputs = {
@@ -227,11 +219,18 @@ def benchmark_case(
     }
 
     def run(name: str) -> None:
-        wrapper.run(
+        sm120_fmha_fp8_ragged_prefill(
             q,
             k,
             v,
-            out=outputs[name],
+            outputs[name],
+            qo_indptr,
+            kv_indptr,
+            max_seqlen_q=case.q_len,
+            max_seqlen_k=case.kv_len,
+            sm_scale=1.0 / math.sqrt(case.head_dim),
+            q_tile=q_tile,
+            kv_tile=kv_tile,
             enable_pdl=True,
             skip_softmax_threshold_scale_factor=thresholds[name],
         )
@@ -286,6 +285,8 @@ def benchmark_case(
                 "num_q_heads": case.num_q_heads,
                 "num_kv_heads": case.num_kv_heads,
                 "head_dim": case.head_dim,
+                "q_tile": q_tile,
+                "kv_tile": kv_tile,
                 "target_skip_fraction": active_skip_fraction,
                 "realized_skip_fraction": realized_skip_fraction,
                 "mode": name,
@@ -314,6 +315,7 @@ def benchmark_case(
         "case="
         f"{case.name} batch={case.batch_size} q_len={case.q_len} kv_len={case.kv_len} "
         f"hq={case.num_q_heads} hkv={case.num_kv_heads} d={case.head_dim} "
+        f"q_tile={q_tile} kv_tile={kv_tile} "
         f"negligible_tiles={negligible_tiles}/{complete_kv_tiles} "
         f"realized_skip_fraction={realized_skip_fraction:.6f}"
     )
@@ -346,6 +348,7 @@ def main() -> None:
         f"preset={args.preset} cases={len(cases)} warmup={args.warmup} "
         f"repeat={args.repeat} seed={args.seed} active_skip_factor={args.skip_scale_factor}"
     )
+    print(f"q_tile={args.q_tile} kv_tile={args.kv_tile}")
     print(f"active_skip_fraction={args.active_skip_fraction}")
     print("active_mode_data=synthetic_controlled_skip_fraction")
     print("timing=CUPTI_preferred_CUDA_events_fallback warm_L2")
@@ -358,6 +361,8 @@ def main() -> None:
                 case,
                 skip_scale_factor=args.skip_scale_factor,
                 active_skip_fraction=args.active_skip_fraction,
+                q_tile=args.q_tile,
+                kv_tile=args.kv_tile,
                 warmup=args.warmup,
                 repeat=args.repeat,
                 seed=args.seed,
