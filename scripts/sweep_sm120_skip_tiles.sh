@@ -11,7 +11,8 @@ gpu_id="${GPU_ID:-4}"
 numa_node=$((gpu_id / 4))
 pr_ref="origin/sm120-prims-skip-softmax-pr"
 result_root="${RESULT_ROOT:-${repo_parent}/sm120-skip-tile-sweep/$(date -u +%Y%m%dT%H%M%SZ)}"
-tile_configs=("128 128" "64 128" "128 64" "64 64")
+tile_config_spec="${TILE_CONFIGS:-128:128,64:128,128:64,64:64}"
+IFS=',' read -r -a tile_configs <<<"${tile_config_spec}"
 fractions=(0.75 0.9 0.99)
 
 mkdir -p "${result_root}"
@@ -22,6 +23,7 @@ echo "PERF_COMMIT=$(git -C "${repo_root}" rev-parse HEAD)"
 echo "PR_COMMIT=$(git -C "${repo_root}" rev-parse "${pr_ref}")"
 echo "GPU_ID=${gpu_id}"
 echo "NUMA_NODE=${numa_node}"
+echo "TILE_CONFIGS=${tile_config_spec}"
 
 runtime_files=(
   flashinfer/attention/cute_dsl/sm120_fmha.py
@@ -37,7 +39,13 @@ fi
 bash "${repo_root}/scripts/pro5000_preflight.sh" "${gpu_id}"
 
 for config in "${tile_configs[@]}"; do
-  read -r q_tile kv_tile <<<"${config}"
+  q_tile="${config%%:*}"
+  kv_tile="${config##*:}"
+  if [[ "${q_tile}" != "64" && "${q_tile}" != "128" ]] || \
+    [[ "${kv_tile}" != "64" && "${kv_tile}" != "128" ]]; then
+    echo "ERROR: invalid TILE_CONFIGS entry '${config}'; expected Q:KV with 64 or 128" >&2
+    exit 2
+  fi
   for fraction in "${fractions[@]}"; do
     label="q${q_tile}-kv${kv_tile}-fraction-${fraction}"
     echo "SWEEP_START ${label}"
