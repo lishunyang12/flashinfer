@@ -1294,9 +1294,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         mma_params: SimpleNamespace,
         softmax_params: SimpleNamespace,
         s_regs: cutlass.Array,
+        tile_row_max: cutlass.Array,
         kv_seq_idx: cutlass.Int32,
         is_masked_frontier_tile: cutlass.Constexpr[bool],
         uses_softmax_init_path: cutlass.Constexpr[bool],
+        uses_precomputed_tile_row_max: cutlass.Constexpr[bool],
     ) -> tuple:
         """Original direct row-state softmax for the two-buffer path."""
         o_regs = mma_params.o_regs
@@ -1332,32 +1334,35 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     )
                     has_valid_cols = kv_seq_idx < valid_cols
 
-            cur_max0 = -cutlass.Float32.inf
-            cur_max1 = -cutlass.Float32.inf
-            for k_frag in cutlass.range_constexpr(self.qk_k_frags):
-                s_off = k_frag * 4
-                s0 = s_regs[s_off + s_reg_idx_lo]
-                s1 = s_regs[s_off + s_reg_idx_hi]
-                if cutlass.const_expr(is_masked_frontier_tile):
-                    k_col0 = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4
-                    k_col1 = k_col0 + 1
-                    if cutlass.const_expr(self.is_causal):
-                        valid0 = k_col0 < valid_cols if has_valid_cols else False
-                        valid1 = k_col1 < valid_cols if has_valid_cols else False
-                    else:
-                        valid0 = k_col0 < valid_cols
-                        valid1 = k_col1 < valid_cols
-                    if not valid0:
-                        s0 = -cutlass.Float32.inf
-                    if not valid1:
-                        s1 = -cutlass.Float32.inf
-                s_regs[s_off + s_reg_idx_lo] = s0
-                s_regs[s_off + s_reg_idx_hi] = s1
-                cur_max0 = cute.arch.fmax(cur_max0, s0)
-                cur_max1 = cute.arch.fmax(cur_max1, s1)
+            if cutlass.const_expr(uses_precomputed_tile_row_max):
+                cur_max = nvvm_threadquad_reduction_max(tile_row_max[row_half])
+            else:
+                cur_max0 = -cutlass.Float32.inf
+                cur_max1 = -cutlass.Float32.inf
+                for k_frag in cutlass.range_constexpr(self.qk_k_frags):
+                    s_off = k_frag * 4
+                    s0 = s_regs[s_off + s_reg_idx_lo]
+                    s1 = s_regs[s_off + s_reg_idx_hi]
+                    if cutlass.const_expr(is_masked_frontier_tile):
+                        k_col0 = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4
+                        k_col1 = k_col0 + 1
+                        if cutlass.const_expr(self.is_causal):
+                            valid0 = k_col0 < valid_cols if has_valid_cols else False
+                            valid1 = k_col1 < valid_cols if has_valid_cols else False
+                        else:
+                            valid0 = k_col0 < valid_cols
+                            valid1 = k_col1 < valid_cols
+                        if not valid0:
+                            s0 = -cutlass.Float32.inf
+                        if not valid1:
+                            s1 = -cutlass.Float32.inf
+                    s_regs[s_off + s_reg_idx_lo] = s0
+                    s_regs[s_off + s_reg_idx_hi] = s1
+                    cur_max0 = cute.arch.fmax(cur_max0, s0)
+                    cur_max1 = cute.arch.fmax(cur_max1, s1)
 
-            cur_max = cute.arch.fmax(cur_max0, cur_max1)
-            cur_max = nvvm_threadquad_reduction_max(cur_max)
+                cur_max = cute.arch.fmax(cur_max0, cur_max1)
+                cur_max = nvvm_threadquad_reduction_max(cur_max)
 
             old_scale = cutlass.Float32(1.0)
             if cutlass.const_expr(uses_softmax_init_path):
@@ -2126,9 +2131,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     mma_params,
                     softmax_params,
                     s_regs,
+                    tile_row_max,
                     kv_seq_idx,
                     is_masked_frontier_tile,
                     uses_softmax_init_path,
+                    tracks_tile_row_max,
                 )
                 self.mma_pv_single_buffer_preloaded(
                     basic_params,
@@ -2142,9 +2149,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 mma_params,
                 softmax_params,
                 s_regs,
+                tile_row_max,
                 kv_seq_idx,
                 is_masked_frontier_tile,
                 uses_softmax_init_path,
+                tracks_tile_row_max,
             )
             self.mma_pv_single_buffer_preloaded(
                 basic_params,
