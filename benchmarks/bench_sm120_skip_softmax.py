@@ -70,6 +70,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--skip-scale-factor", type=float, default=1.0)
+    parser.add_argument(
+        "--active-skip-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Target fraction of complete 128-token KV tiles made negligible in "
+            "skip_active mode. The default preserves the legacy upper-bound case."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
@@ -100,6 +109,10 @@ def selected_cases(args: argparse.Namespace) -> tuple[BenchCase, ...]:
 def validate_args(args: argparse.Namespace, cases: tuple[BenchCase, ...]) -> None:
     if args.skip_scale_factor <= 0 or not math.isfinite(args.skip_scale_factor):
         raise ValueError("skip-scale-factor must be finite and positive")
+    if args.active_skip_fraction is not None and not (
+        math.isfinite(args.active_skip_fraction) and 0 <= args.active_skip_fraction < 1
+    ):
+        raise ValueError("active-skip-fraction must be finite and in [0, 1)")
     if args.warmup <= 0 or args.repeat < 2:
         raise ValueError("warmup must be positive and repeat must be at least 2")
     for case in cases:
@@ -134,6 +147,7 @@ def benchmark_case(
     case: BenchCase,
     *,
     skip_scale_factor: float,
+    active_skip_fraction: float | None,
     warmup: int,
     repeat: int,
     seed: int,
@@ -144,18 +158,29 @@ def benchmark_case(
     total_q = case.batch_size * case.q_len
     total_kv = case.batch_size * case.kv_len
 
-    # The SM120 kernel traverses KV from right to left. The final 128 tokens
-    # receive dominant logits; earlier tokens are negligible. This deliberately
-    # synthetic distribution makes the active mode a skip-friendly upper-bound,
-    # while the tiny-threshold mode measures specialization overhead without
-    # intentionally skipping a tile.
+    # The SM120 kernel traverses KV from right to left. Give the trailing tiles
+    # dominant logits and make a controlled fraction of earlier complete tiles
+    # negligible. This isolates speedup as a function of tiles skipped.
     q = torch.ones(total_q, case.num_q_heads, case.head_dim, device=device, dtype=fp8)
     k = torch.zeros(
         total_kv, case.num_kv_heads, case.head_dim, device=device, dtype=fp8
     )
+    complete_kv_tiles = case.kv_len // 128
+    if active_skip_fraction is None:
+        negligible_tiles = max(complete_kv_tiles - 1, 0)
+    else:
+        negligible_tiles = min(
+            int(complete_kv_tiles * active_skip_fraction),
+            max(complete_kv_tiles - 1, 0),
+        )
+    negligible_tokens = negligible_tiles * 128
+    dominant_tokens = case.kv_len - negligible_tokens
+    realized_skip_fraction = (
+        negligible_tiles / complete_kv_tiles if complete_kv_tiles else 0.0
+    )
     for batch_idx in range(case.batch_size):
         end = (batch_idx + 1) * case.kv_len
-        k[end - 128 : end] = 1
+        k[end - dominant_tokens : end] = 1
     v = torch.randint(
         -2,
         3,
@@ -261,6 +286,8 @@ def benchmark_case(
                 "num_q_heads": case.num_q_heads,
                 "num_kv_heads": case.num_kv_heads,
                 "head_dim": case.head_dim,
+                "target_skip_fraction": active_skip_fraction,
+                "realized_skip_fraction": realized_skip_fraction,
                 "mode": name,
                 "threshold_scale_factor": threshold,
                 "median_ms": median_ms,
@@ -286,7 +313,9 @@ def benchmark_case(
     print(
         "case="
         f"{case.name} batch={case.batch_size} q_len={case.q_len} kv_len={case.kv_len} "
-        f"hq={case.num_q_heads} hkv={case.num_kv_heads} d={case.head_dim}"
+        f"hq={case.num_q_heads} hkv={case.num_kv_heads} d={case.head_dim} "
+        f"negligible_tiles={negligible_tiles}/{complete_kv_tiles} "
+        f"realized_skip_fraction={realized_skip_fraction:.6f}"
     )
     for row in rows:
         print(
@@ -317,7 +346,8 @@ def main() -> None:
         f"preset={args.preset} cases={len(cases)} warmup={args.warmup} "
         f"repeat={args.repeat} seed={args.seed} active_skip_factor={args.skip_scale_factor}"
     )
-    print("active_mode_data=synthetic_skip_friendly_upper_bound")
+    print(f"active_skip_fraction={args.active_skip_fraction}")
+    print("active_mode_data=synthetic_controlled_skip_fraction")
     print("timing=CUPTI_preferred_CUDA_events_fallback warm_L2")
 
     rows = []
@@ -327,6 +357,7 @@ def main() -> None:
             benchmark_case(
                 case,
                 skip_scale_factor=args.skip_scale_factor,
+                active_skip_fraction=args.active_skip_fraction,
                 warmup=args.warmup,
                 repeat=args.repeat,
                 seed=args.seed,
