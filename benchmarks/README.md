@@ -638,6 +638,12 @@ compare its dense, no-tile-skipped, and active skip-softmax specializations:
 GPU_ID=0 bash scripts/probe_sm120_bf16_skip_softmax.sh
 ```
 
+Profile the same BF16 path at a 16K MiniMax-H3-shaped workload:
+
+```bash
+GPU_ID=0 bash scripts/profile_sm120_bf16_skip_softmax_ncu.sh
+```
+
 - moe_a2a: MoE All-to-All communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
 - allreduce: AllReduce fusion communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
 - triton: Triton reference kernels (used for Mamba selective_state_update and GDN decode/MTP)
