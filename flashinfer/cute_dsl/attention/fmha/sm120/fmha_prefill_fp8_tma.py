@@ -2219,9 +2219,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     ) -> None:
         """D128 path that loads V only when every compute warp retains a tile."""
         k_iteration = num_kv_tiles - cutlass.Int32(1) - kv_tile_idx
-        k_phase = (k_iteration // self.kv_pipeline_stages) & cutlass.Int32(1)
+        k_phase = (k_iteration // cutlass.Int32(2)) & cutlass.Int32(1)
         v_phase = k_iteration & cutlass.Int32(1)
-        sKV = self.get_kv_stage_ptr(mma_params.sKV, k_stage)
+        sK = self.get_kv_stage_ptr(mma_params.sKV, k_stage)
+        sV = mma_params.sKV.data_ptr(2 * self.kv_tile_elems)
         k_arrived = self.get_mbar_stage_ptr(basic_params.mbar_arrived, k_stage)
         k_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, k_stage)
         v_arrived = basic_params.mbar_conditional_v_arrived
@@ -2233,7 +2234,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         s_regs, tile_row_max = self.mma_qk_single_buffer(
             basic_params,
             q_regs,
-            sKV,
+            sK,
             tracks_tile_row_max,
         )
 
@@ -2278,7 +2279,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     prims.mbarrier_arrive_expect_tx(v_arrived, 0)
             else:
                 self.load_one_kv_tile(
-                    sKV,
+                    sV,
                     basic_params.tma_v_desc_ptr,
                     v_arrived,
                     basic_params.kv_head_idx,
@@ -2292,7 +2293,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 basic_params,
                 mma_params,
                 softmax_params,
-                sKV,
+                sV,
                 s_regs,
                 tile_row_max,
                 kv_seq_idx,
@@ -2303,7 +2304,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             self.mma_pv_single_buffer_preloaded(
                 basic_params,
                 mma_params,
-                sKV,
+                sV,
                 p_regs,
                 v_initial,
             )
@@ -2498,14 +2499,14 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 )
             cached_page = cutlass.Int32(0)
             if cutlass.const_expr(uses_conditional_v):
-                # Keep three future K tiles resident.  A stage is reused for
-                # V only after all compute warps finish QK and vote to retain
-                # the tile, so skipped tiles never issue a V transfer.
+                # Keep two future K tiles resident in stages 0/1 and reserve
+                # stage 2 for an on-demand V tile.  Skipped tiles never issue
+                # a V transfer.
                 tile_iteration = cutlass.Int32(0)
                 stage = cutlass.Int32(0)
                 empty_phase = cutlass.Int32(0)
                 while tile_iteration < num_kv_tiles:
-                    if tile_iteration >= self.kv_pipeline_stages:
+                    if tile_iteration >= 2:
                         empty = self.get_mbar_stage_ptr(mbar_consumed, stage)
                         self.wait_pipeline_barrier(empty, empty_phase)
 
@@ -2524,9 +2525,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     )
                     tile_iteration += 1
                     stage += 1
-                    if stage == self.kv_pipeline_stages:
+                    if stage == 2:
                         stage = cutlass.Int32(0)
-                        if tile_iteration > self.kv_pipeline_stages:
+                        if tile_iteration > 2:
                             empty_phase ^= cutlass.Int32(1)
             elif cutlass.const_expr(uses_three_stage_pipeline):
                 # Treat K and V as one ordered operand stream. Three ring slots
@@ -2910,7 +2911,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 kv_tile_idx -= 1
                 if cutlass.const_expr(uses_conditional_v):
                     pipeline_k_stage += 1
-                    if pipeline_k_stage == self.kv_pipeline_stages:
+                    if pipeline_k_stage == 2:
                         pipeline_k_stage = cutlass.Int32(0)
                 elif cutlass.const_expr(uses_unified_kv_ring):
                     if pipeline_k_stage == 0:
@@ -2975,7 +2976,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 kv_tile_idx -= 1
                 if cutlass.const_expr(uses_conditional_v):
                     pipeline_k_stage += 1
-                    if pipeline_k_stage == self.kv_pipeline_stages:
+                    if pipeline_k_stage == 2:
                         pipeline_k_stage = cutlass.Int32(0)
                 elif cutlass.const_expr(uses_unified_kv_ring):
                     if pipeline_k_stage == 0:
