@@ -1034,12 +1034,15 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             0,
                             k_pair,
                         )
-                for pair_in_block in cutlass.range_constexpr(2):
-                    k_pair = k_block * 2 + pair_in_block
-                    k_next[k_pair * 2], k_next[k_pair * 2 + 1] = load_k_fragment_pair(
-                        d_next,
-                        k_pair,
-                    )
+                if cutlass.const_expr(d_frag + 1 < self.qk_d_frags):
+                    for pair_in_block in cutlass.range_constexpr(2):
+                        k_pair = k_block * 2 + pair_in_block
+                        k_next[k_pair * 2], k_next[k_pair * 2 + 1] = (
+                            load_k_fragment_pair(
+                                d_next,
+                                k_pair,
+                            )
+                        )
             if cutlass.const_expr(
                 tracks_tile_row_max and d_frag + 1 == self.qk_d_frags
             ):
