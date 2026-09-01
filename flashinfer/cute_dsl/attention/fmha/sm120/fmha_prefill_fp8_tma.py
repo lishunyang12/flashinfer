@@ -2176,16 +2176,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 self.COMPUTE_BARRIER_ID,
                 thread_count=self.threads_compute,
             )
-            vote_words = cute.make_tensor(
-                cute.recast_ptr(
-                    basic_params.skip_softmax_warp_votes.data_ptr(vote_offset),
-                    dtype=cutlass.Int32,
-                ),
-                cute.make_layout((self.num_compute_warps // 4,)),
-            )
             skip_votes = cutlass.Int32(0)
-            for vote_word in cutlass.range_constexpr(self.num_compute_warps // 4):
-                skip_votes += cute.arch.popc(vote_words[vote_word])
+            for vote_warp in cutlass.range_constexpr(self.num_compute_warps):
+                skip_votes += cutlass.Int32(
+                    basic_params.skip_softmax_warp_votes[vote_offset + vote_warp]
+                )
             skip_softmax = skip_votes == self.num_compute_warps
 
             if not skip_softmax:
