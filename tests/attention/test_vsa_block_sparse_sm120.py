@@ -591,6 +591,22 @@ def test_vsa_sm120_skip_softmax(dtype, workspace):
     torch.testing.assert_close(dense, skipped, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(dense_lse, skipped_lse, atol=1e-2, rtol=1e-2)
 
+    # A V tile is shared by all four compute warps. If one warp still needs a
+    # tile, the CTA must load it and all warps must take the dense update.
+    mixed_q = torch.ones_like(q)
+    mixed_q.view(num_blocks, R, num_heads, HEAD_DIM)[:, 3 * R // 4 :].fill_(-1)
+    mixed_v = torch.zeros_like(v)
+    mixed_v[-2 * R : -R].fill_(-1)
+    mixed_v[-R:].fill_(1)
+    mixed_dense = wrapper.run(mixed_q, k, mixed_v)
+    mixed_skipped = wrapper.run(
+        mixed_q,
+        k,
+        mixed_v,
+        skip_softmax_threshold_scale_factor=1.0,
+    )
+    torch.testing.assert_close(mixed_dense, mixed_skipped, atol=0, rtol=0)
+
     with pytest.raises(
         ValueError, match="skip_softmax_threshold_scale_factor must be finite"
     ):

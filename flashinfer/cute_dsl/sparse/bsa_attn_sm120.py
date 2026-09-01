@@ -133,8 +133,8 @@ def bsa_attn_sm120_blk64_fwd(
             (batch, num_heads, num_q_blocks) int32. Optional.
         softmax_scale: Softmax scale (default: 1/sqrt(head_dim)).
         skip_softmax_threshold_scale_factor: Skip a K/V tile when its contribution
-            is below ``scale_factor / seqlen_k`` for every row owned by a warp.
-            None or zero selects the dense specialization.
+            is below ``scale_factor / seqlen_k`` for every row in the CTA's
+            query tile. None or zero selects the dense specialization.
         return_lse: Whether to return log-sum-exp.
         out: Pre-allocated output tensor (batch, seqlen_q, num_heads, head_dim).
         lse: Pre-allocated LSE tensor (batch, num_heads, seqlen_q).

@@ -60,6 +60,10 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.num_threads = 128
         self.kv_stage = 1
         self.q_stage = 1
+        self.skip_softmax_cta_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=self.num_threads,
+        )
 
         assert gqa_ratio >= 1
         assert head_dim == 128, "SM120 blk64 fwd currently requires QK dim 128"
@@ -190,6 +194,9 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         sV = shared_storage.V_smem.get_tensor(
             V_smem_layout.outer, swizzle=V_smem_layout.inner
         )
+        skip_softmax_warp_votes = shared_storage.skip_softmax_warp_votes.get_tensor(
+            cute.make_layout((self.num_threads // cute.arch.WARP_SIZE,))
+        )
 
         mO_slice = mO[None, None, work_desc.qo_head_idx, work_desc.batch_idx]
         mLSE_slice = mLSE[None, work_desc.qo_head_idx, work_desc.batch_idx]
@@ -313,6 +320,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         tOrO.store(cute.full_like(tOrO, 0.0, self.acc_dtype))
         max_m.store(cute.full_like(max_m, float("-inf"), cutlass.Float32))
         sum_m.store(cute.full_like(sum_m, 0.0, cutlass.Float32))
+        enable_skip_softmax = skip_softmax_threshold_log2 is not None
 
         if warp_idx == 0:
             Q_pipeline.producer_acquire(Q_producer_state)
@@ -338,15 +346,16 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 )
                 K_pipeline.producer_commit(K_producer_state)
                 K_producer_state.advance()
-                V_pipeline.producer_acquire(V_producer_state)
-                cute.copy(
-                    tma_atom_V,
-                    tVgV[None, physical_idx],
-                    tVsV[None, V_producer_state.index],
-                    tma_bar_ptr=V_pipeline.producer_get_barrier(V_producer_state),
-                )
-                V_pipeline.producer_commit(V_producer_state)
-                V_producer_state.advance()
+                if cutlass.const_expr(not enable_skip_softmax):
+                    V_pipeline.producer_acquire(V_producer_state)
+                    cute.copy(
+                        tma_atom_V,
+                        tVgV[None, physical_idx],
+                        tVsV[None, V_producer_state.index],
+                        tma_bar_ptr=V_pipeline.producer_get_barrier(V_producer_state),
+                    )
+                    V_pipeline.producer_commit(V_producer_state)
+                    V_producer_state.advance()
             if cutlass.const_expr(self.kv_stage > 1):
                 preload_count = cutlass.Int32(1)
                 if preload_count < num_n_tiles:
@@ -361,15 +370,18 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     )
                     K_pipeline.producer_commit(K_producer_state)
                     K_producer_state.advance()
-                    V_pipeline.producer_acquire(V_producer_state)
-                    cute.copy(
-                        tma_atom_V,
-                        tVgV[None, physical_idx],
-                        tVsV[None, V_producer_state.index],
-                        tma_bar_ptr=V_pipeline.producer_get_barrier(V_producer_state),
-                    )
-                    V_pipeline.producer_commit(V_producer_state)
-                    V_producer_state.advance()
+                    if cutlass.const_expr(not enable_skip_softmax):
+                        V_pipeline.producer_acquire(V_producer_state)
+                        cute.copy(
+                            tma_atom_V,
+                            tVgV[None, physical_idx],
+                            tVsV[None, V_producer_state.index],
+                            tma_bar_ptr=V_pipeline.producer_get_barrier(
+                                V_producer_state
+                            ),
+                        )
+                        V_pipeline.producer_commit(V_producer_state)
+                        V_producer_state.advance()
 
         cute.arch.sync_threads()
 
@@ -430,15 +442,44 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             if varblk < self.tile_size:
                 mask(tSrS, tScS, varblk)
 
-            enable_skip_softmax = skip_softmax_threshold_log2 is not None
             skip_softmax = cutlass.Boolean(False)
             if cutlass.const_expr(enable_skip_softmax):
-                skip_softmax = should_skip_softmax(
+                warp_wants_skip = should_skip_softmax(
                     tSrS,
                     max_m,
                     scale_softmax_log2e,
                     skip_softmax_threshold_log2,
                 )
+                with cute.arch.elect_one():
+                    skip_softmax_warp_votes[warp_idx] = warp_wants_skip
+                self.skip_softmax_cta_barrier.arrive_and_wait()
+                skip_softmax_votes_i32 = cute.make_tensor(
+                    cute.recast_ptr(
+                        skip_softmax_warp_votes.iterator,
+                        dtype=cutlass.Int32,
+                    ),
+                    cute.make_layout((1,)),
+                )
+                skip_softmax = (
+                    cute.arch.popc(skip_softmax_votes_i32[0])
+                    == self.num_threads // cute.arch.WARP_SIZE
+                )
+                # V is shared by the CTA, so omit its transfer only after all
+                # four warps agree. Start a required transfer before softmax
+                # to overlap its latency with the scalar work below.
+                if not skip_softmax:
+                    if warp_idx == 0:
+                        V_pipeline.producer_acquire(V_producer_state)
+                        cute.copy(
+                            tma_atom_V,
+                            tVgV[None, n_tile_idx],
+                            tVsV[None, V_producer_state.index],
+                            tma_bar_ptr=V_pipeline.producer_get_barrier(
+                                V_producer_state
+                            ),
+                        )
+                        V_pipeline.producer_commit(V_producer_state)
+                        V_producer_state.advance()
 
             # Compute P @ V.
             tOrP_frg = cute.make_rmem_tensor_like(tSrS, self.K_dtype)
@@ -453,12 +494,11 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 rescale_o_for_next_acc(tOrO, row_scale)
                 tOrP_frg.store(tSrS.load().to(self.K_dtype))
 
-            V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
-            V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
-
-            v_stage = V_consumer_state.index
             if cutlass.const_expr(enable_skip_softmax):
                 if not skip_softmax:
+                    V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
+                    V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
+                    v_stage = V_consumer_state.index
                     gemm_rs_smem(
                         tiled_mma_pv,
                         tOrO,
@@ -467,7 +507,12 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                         tOsV_copy[None, None, None, v_stage],
                         smem_tiled_copy_V,
                     )
+                    V_pipeline.consumer_release(V_consumer_state)
+                    V_consumer_state.advance()
             else:
+                V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
+                V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
+                v_stage = V_consumer_state.index
                 gemm_rs_smem(
                     tiled_mma_pv,
                     tOrO,
@@ -476,20 +521,19 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     tOsV_copy[None, None, None, v_stage],
                     smem_tiled_copy_V,
                 )
+                V_pipeline.consumer_release(V_consumer_state)
+                V_consumer_state.advance()
 
-            V_pipeline.consumer_release(V_consumer_state)
-            V_consumer_state.advance()
-
-            if warp_idx == 0 and preload_count < num_n_tiles:
-                V_pipeline.producer_acquire(V_producer_state)
-                cute.copy(
-                    tma_atom_V,
-                    tVgV[None, preload_physical],
-                    tVsV[None, V_producer_state.index],
-                    tma_bar_ptr=V_pipeline.producer_get_barrier(V_producer_state),
-                )
-                V_pipeline.producer_commit(V_producer_state)
-                V_producer_state.advance()
+                if warp_idx == 0 and preload_count < num_n_tiles:
+                    V_pipeline.producer_acquire(V_producer_state)
+                    cute.copy(
+                        tma_atom_V,
+                        tVgV[None, preload_physical],
+                        tVsV[None, V_producer_state.index],
+                        tma_bar_ptr=V_pipeline.producer_get_barrier(V_producer_state),
+                    )
+                    V_pipeline.producer_commit(V_producer_state)
+                    V_producer_state.advance()
 
         final_ratio, lse = finalize_softmax(max_m, sum_m, scale_softmax_log2e)
         rescale_o_for_next_acc(tOrO, final_ratio)
@@ -631,6 +675,9 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             Q_barrier: cute.struct.MemRange[cutlass.Int64, self.q_stage * 2]
             K_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
             V_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
+            skip_softmax_warp_votes: cute.struct.MemRange[
+                cutlass.Int8, self.num_threads // 32
+            ]
 
             Q_smem: cute.struct.Align[
                 cute.struct.MemRange[self.Q_dtype, cute.cosize(self.Q_smem_layout)], 128
