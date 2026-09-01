@@ -2046,8 +2046,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 # the first V consumer so scalar work hides the TMA transfer.
                 self.wait_pipeline_barrier(v_arrived, v_phase)
                 self.mma_pv(basic_params, mma_params, p_regs, sV)
-            else:
-                # Even a skipped tile must consume its V pipeline slot.
+            elif kv_tile_idx == 0:
+                # The epilogue aliases the whole K/V ring, so the final V
+                # transfer must be complete even when its tile is skipped.
                 self.wait_pipeline_barrier(v_arrived, v_phase)
         else:
             p_regs, row_state = self.online_softmax(
@@ -2147,10 +2148,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     is_masked_frontier_tile,
                 )
 
-        self.wait_pipeline_barrier(v_arrived, v_phase)
-
         if cutlass.const_expr(enable_skip_softmax):
             if not skip_softmax:
+                self.wait_pipeline_barrier(v_arrived, v_phase)
                 p_regs, v_initial = self.online_softmax_single_buffer(
                     basic_params,
                     mma_params,
@@ -2170,7 +2170,16 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     p_regs,
                     v_initial,
                 )
+            elif cutlass.const_expr(not uses_kv_ring):
+                # Fixed two-slot paths still rely on compute to keep the
+                # producer from reusing V before its TMA transfer completes.
+                self.wait_pipeline_barrier(v_arrived, v_phase)
+            elif kv_tile_idx == 0:
+                # The epilogue aliases the whole K/V ring, so the final V
+                # transfer must be complete even when its tile is skipped.
+                self.wait_pipeline_barrier(v_arrived, v_phase)
         else:
+            self.wait_pipeline_barrier(v_arrived, v_phase)
             p_regs, v_initial = self.online_softmax_single_buffer(
                 basic_params,
                 mma_params,
@@ -2375,6 +2384,19 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     if operand_idx >= self.kv_pipeline_stages:
                         empty = self.get_mbar_stage_ptr(mbar_consumed, stage)
                         self.wait_pipeline_barrier(empty, empty_phase)
+                        # A skipped tile can release its V slot before the
+                        # asynchronous TMA transfer completes.  The producer
+                        # owns the final arrival check before reusing that
+                        # slot.  With three stages, an even new operand
+                        # replaces a V operand from the preceding generation.
+                        if cutlass.const_expr(
+                            skip_softmax_threshold_log2 is not None
+                        ):
+                            if operand_idx & cutlass.Int32(1) == 0:
+                                arrived = self.get_mbar_stage_ptr(
+                                    mbar_arrived, stage
+                                )
+                                self.wait_pipeline_barrier(arrived, empty_phase)
 
                     tile_iteration = operand_idx // cutlass.Int32(2)
                     kv_seq_idx = (
