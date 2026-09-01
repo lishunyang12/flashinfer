@@ -1006,10 +1006,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         s_regs[s_off + 3],
                         self.in_dtype,
                     )
-                # On the final head-dimension fragment, reduce the preceding
-                # score block while this block's independent MMA results are
-                # still in flight. This overlaps the skip predicate's scalar
-                # work with QK instead of scanning every score afterward.
+                # Reduce the preceding score block while this block's MMA is
+                # in flight. Alternating blocks between two max chains halves
+                # their dependency depth without the register cost of one
+                # accumulator per block.
                 if cutlass.const_expr(
                     tracks_tile_row_max
                     and d_frag + 1 == self.qk_d_frags
