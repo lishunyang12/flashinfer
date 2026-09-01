@@ -119,5 +119,8 @@ run_python -m pytest -q -s \
 run_python -m pytest -q -s \
   "${repo_root}/tests/attention/test_sm120_prims_prefill_backend.py" \
   -k "ragged_public_wrapper or paged_public_wrapper"
+run_python -m pytest -q -s \
+  "${repo_root}/tests/attention/test_vsa_block_sparse_sm120.py" \
+  -k "vsa_sm120_skip_softmax"
 
 echo "SM120_SKIP_SOFTMAX_VALIDATION: PASS"
