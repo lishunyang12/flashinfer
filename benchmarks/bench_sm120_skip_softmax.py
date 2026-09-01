@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 FlashInfer contributors.
 # SPDX-License-Identifier: Apache-2.0
-"""Measure SM120 PRIMS skip-softmax overhead and skip-friendly speedup."""
+"""Measure SM120 PRIMS skip-softmax across representative video DiT shapes."""
 
 import argparse
+import csv
 import math
 import statistics
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -12,8 +15,54 @@ import flashinfer
 from flashinfer.testing import bench_gpu_time
 
 
+@dataclass(frozen=True)
+class BenchCase:
+    name: str
+    q_len: int
+    kv_len: int
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int = 128
+    batch_size: int = 1
+
+
+# These are attention-layer shapes, not end-to-end model benchmarks. The exact
+# model points follow the public model layouts:
+#
+# * MiniMax H3: 56 heads x 128, 768x1344 output, [1,2,2] DiT patches.
+#   The packed lengths use the 537-token prompt from the vLLM-Omni SM120
+#   benchmark and include its 40 Hz stereo audio rows and 64-row padding.
+# * Wan2.2 A14B: 40 heads x 128, [1,2,2] DiT patches after the 4x8x8
+#   temporal/spatial VAE compression. The listed lengths are the exact latent
+#   token counts for the named resolution and frame count.
+# The TP2+Ulysses2 and Ulysses4 entries additionally cover the per-rank head
+# shapes used by the corresponding four- and eight-GPU vLLM-Omni recipes.
+MODEL_CASES = (
+    BenchCase("minimax_h3_sweep_4k", 4096, 4096, 56, 56),
+    BenchCase("minimax_h3_sweep_16k", 16384, 16384, 56, 56),
+    BenchCase("minimax_h3_768p_4s_107f", 33152, 33152, 56, 56),
+    BenchCase("minimax_h3_768p_5s_124f", 38272, 38272, 56, 56),
+    BenchCase("minimax_h3_tp2_usp2_5s_124f", 38272, 38272, 14, 14),
+    BenchCase("minimax_h3_768p_8p7s_209f", 63744, 63744, 56, 56),
+    BenchCase("minimax_h3_tp2_usp2_8p7s_209f", 63744, 63744, 14, 14),
+    BenchCase("minimax_h3_768p_15s_362f", 109632, 109632, 56, 56),
+    BenchCase("wan22_sweep_4k", 4096, 4096, 40, 40),
+    BenchCase("wan22_sweep_16k", 16384, 16384, 40, 40),
+    BenchCase("wan22_480p_81f", 32760, 32760, 40, 40),
+    BenchCase("wan22_720p_81f", 75600, 75600, 40, 40),
+    BenchCase("wan22_usp4_720p_81f", 75600, 75600, 10, 10),
+    BenchCase("wan22_720p_121f", 111600, 111600, 40, 40),
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--preset",
+        choices=("models", "minimax-h3", "wan2.2", "custom"),
+        default="models",
+        help="Shape matrix to run; models covers MiniMax H3 and Wan2.2.",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--q-len", type=int, default=256)
     parser.add_argument("--kv-len", type=int, default=4096)
@@ -21,26 +70,58 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--skip-scale-factor", type=float, default=1.0)
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--repeat", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--csv", type=Path)
     return parser.parse_args()
 
 
-def validate_args(args: argparse.Namespace) -> None:
-    for name in ("batch_size", "q_len", "kv_len", "num_q_heads", "num_kv_heads"):
-        if getattr(args, name) <= 0:
-            raise ValueError(f"{name.replace('_', '-')} must be positive")
-    if args.num_q_heads % args.num_kv_heads:
-        raise ValueError("num-q-heads must be divisible by num-kv-heads")
-    if args.head_dim not in (32, 64, 128, 256):
-        raise ValueError("head-dim must be one of 32, 64, 128, 256")
-    if args.kv_len < 256 or args.kv_len % 128:
-        raise ValueError("kv-len must be at least 256 and divisible by 128")
+def selected_cases(args: argparse.Namespace) -> tuple[BenchCase, ...]:
+    if args.preset == "models":
+        return MODEL_CASES
+    if args.preset == "minimax-h3":
+        return tuple(case for case in MODEL_CASES if case.name.startswith("minimax_h3"))
+    if args.preset == "wan2.2":
+        return tuple(case for case in MODEL_CASES if case.name.startswith("wan22"))
+    return (
+        BenchCase(
+            "custom",
+            args.q_len,
+            args.kv_len,
+            args.num_q_heads,
+            args.num_kv_heads,
+            args.head_dim,
+            args.batch_size,
+        ),
+    )
+
+
+def validate_args(args: argparse.Namespace, cases: tuple[BenchCase, ...]) -> None:
     if args.skip_scale_factor <= 0 or not math.isfinite(args.skip_scale_factor):
         raise ValueError("skip-scale-factor must be finite and positive")
-    if args.warmup <= 0 or args.repeat <= 0:
-        raise ValueError("warmup and repeat must be positive")
+    if args.warmup <= 0 or args.repeat < 2:
+        raise ValueError("warmup must be positive and repeat must be at least 2")
+    for case in cases:
+        for name in (
+            "batch_size",
+            "q_len",
+            "kv_len",
+            "num_q_heads",
+            "num_kv_heads",
+        ):
+            if getattr(case, name) <= 0:
+                raise ValueError(
+                    f"{case.name}: {name.replace('_', '-')} must be positive"
+                )
+        if case.num_q_heads % case.num_kv_heads:
+            raise ValueError(
+                f"{case.name}: num-q-heads must be divisible by num-kv-heads"
+            )
+        if case.head_dim not in (32, 64, 128, 256):
+            raise ValueError(f"{case.name}: unsupported head-dim {case.head_dim}")
+        if case.kv_len < 256:
+            raise ValueError(f"{case.name}: kv-len must be at least 256")
 
 
 def relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -49,41 +130,45 @@ def relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float((difference / denominator).item())
 
 
-def main() -> None:
-    args = parse_args()
-    validate_args(args)
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
-        raise RuntimeError("This benchmark requires an SM120 GPU")
-
-    torch.manual_seed(args.seed)
+def benchmark_case(
+    case: BenchCase,
+    *,
+    skip_scale_factor: float,
+    warmup: int,
+    repeat: int,
+    seed: int,
+) -> list[dict[str, object]]:
+    torch.manual_seed(seed)
     device = torch.device("cuda")
     fp8 = torch.float8_e4m3fn
-    total_q = args.batch_size * args.q_len
-    total_kv = args.batch_size * args.kv_len
+    total_q = case.batch_size * case.q_len
+    total_kv = case.batch_size * case.kv_len
 
-    # The SM120 kernel traverses KV from right to left. The final tile receives
-    # dominant logits; earlier tiles are negligible and can be skipped with the
-    # default factor while retaining a close dense-attention result.
-    q = torch.ones(total_q, args.num_q_heads, args.head_dim, device=device, dtype=fp8)
+    # The SM120 kernel traverses KV from right to left. The final 128 tokens
+    # receive dominant logits; earlier tokens are negligible. This deliberately
+    # synthetic distribution makes the active mode a skip-friendly upper-bound,
+    # while the tiny-threshold mode measures specialization overhead without
+    # intentionally skipping a tile.
+    q = torch.ones(total_q, case.num_q_heads, case.head_dim, device=device, dtype=fp8)
     k = torch.zeros(
-        total_kv, args.num_kv_heads, args.head_dim, device=device, dtype=fp8
+        total_kv, case.num_kv_heads, case.head_dim, device=device, dtype=fp8
     )
-    for batch_idx in range(args.batch_size):
-        end = (batch_idx + 1) * args.kv_len
+    for batch_idx in range(case.batch_size):
+        end = (batch_idx + 1) * case.kv_len
         k[end - 128 : end] = 1
     v = torch.randint(
         -2,
         3,
-        (total_kv, args.num_kv_heads, args.head_dim),
+        (total_kv, case.num_kv_heads, case.head_dim),
         device=device,
         dtype=torch.float32,
     ).to(fp8)
     qo_indptr = torch.arange(
-        args.batch_size + 1, device=device, dtype=torch.int32
-    ).mul_(args.q_len)
+        case.batch_size + 1, device=device, dtype=torch.int32
+    ).mul_(case.q_len)
     kv_indptr = torch.arange(
-        args.batch_size + 1, device=device, dtype=torch.int32
-    ).mul_(args.kv_len)
+        case.batch_size + 1, device=device, dtype=torch.int32
+    ).mul_(case.kv_len)
     workspace = torch.empty(64 << 20, device=device, dtype=torch.uint8)
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace, "NHD", backend="cute-dsl-prims"
@@ -91,9 +176,9 @@ def main() -> None:
     wrapper.plan(
         qo_indptr,
         kv_indptr,
-        args.num_q_heads,
-        args.num_kv_heads,
-        args.head_dim,
+        case.num_q_heads,
+        case.num_kv_heads,
+        case.head_dim,
         causal=False,
         q_data_type=fp8,
         kv_data_type=fp8,
@@ -103,8 +188,8 @@ def main() -> None:
     outputs = {
         name: torch.empty(
             total_q,
-            args.num_q_heads,
-            args.head_dim,
+            case.num_q_heads,
+            case.head_dim,
             device=device,
             dtype=torch.bfloat16,
         )
@@ -113,7 +198,7 @@ def main() -> None:
     thresholds = {
         "dense": None,
         "skip_no_tiles": 1e-30,
-        "skip_active": args.skip_scale_factor,
+        "skip_active": skip_scale_factor,
     }
 
     def run(name: str) -> None:
@@ -126,7 +211,6 @@ def main() -> None:
             skip_softmax_threshold_scale_factor=thresholds[name],
         )
 
-    # Compile and warm every specialization before correctness or timing.
     for name in thresholds:
         run(name)
     torch.cuda.synchronize()
@@ -140,47 +224,124 @@ def main() -> None:
     active_rel_l2 = relative_l2(active, dense)
     if no_tiles_max_abs > 0.2 or no_tiles_rel_l2 > 0.05:
         raise RuntimeError(
-            "Tiny-threshold skip specialization diverged from dense attention: "
+            f"{case.name}: tiny-threshold specialization diverged from dense: "
             f"max_abs={no_tiles_max_abs:g}, relative_l2={no_tiles_rel_l2:g}"
         )
 
-    timings: dict[str, list[float]] = {}
-    for name in thresholds:
-        timings[name] = bench_gpu_time(
+    timings = {
+        name: bench_gpu_time(
             fn=lambda current=name: run(current),
-            dry_run_iters=args.warmup,
-            repeat_iters=args.repeat,
+            dry_run_iters=warmup,
+            repeat_iters=repeat,
+            enable_cupti=True,
             cold_l2_cache=False,
         )
-
+        for name in thresholds
+    }
     medians = {name: statistics.median(values) for name, values in timings.items()}
+    dense_ms = medians["dense"]
+    dense_equivalent_flops = (
+        4
+        * case.batch_size
+        * case.q_len
+        * case.kv_len
+        * case.num_q_heads
+        * case.head_dim
+    )
+    rows = []
+    for name, threshold in thresholds.items():
+        values = timings[name]
+        median_ms = medians[name]
+        rows.append(
+            {
+                "case": case.name,
+                "batch_size": case.batch_size,
+                "q_len": case.q_len,
+                "kv_len": case.kv_len,
+                "num_q_heads": case.num_q_heads,
+                "num_kv_heads": case.num_kv_heads,
+                "head_dim": case.head_dim,
+                "mode": name,
+                "threshold_scale_factor": threshold,
+                "median_ms": median_ms,
+                "std_ms": statistics.stdev(values),
+                "min_ms": min(values),
+                "max_ms": max(values),
+                "cv": statistics.stdev(values) / statistics.fmean(values),
+                "speedup_vs_dense": dense_ms / median_ms,
+                "dense_equivalent_tflops": dense_equivalent_flops / median_ms / 1e9,
+                "max_abs_vs_dense": {
+                    "dense": 0.0,
+                    "skip_no_tiles": no_tiles_max_abs,
+                    "skip_active": active_max_abs,
+                }[name],
+                "relative_l2_vs_dense": {
+                    "dense": 0.0,
+                    "skip_no_tiles": no_tiles_rel_l2,
+                    "skip_active": active_rel_l2,
+                }[name],
+            }
+        )
+
+    print(
+        "case="
+        f"{case.name} batch={case.batch_size} q_len={case.q_len} kv_len={case.kv_len} "
+        f"hq={case.num_q_heads} hkv={case.num_kv_heads} d={case.head_dim}"
+    )
+    for row in rows:
+        print(
+            f"mode={row['mode']} threshold={row['threshold_scale_factor']} "
+            f"median_ms={row['median_ms']:.6f} std_ms={row['std_ms']:.6f} "
+            f"cv={row['cv']:.4%} min_ms={row['min_ms']:.6f} max_ms={row['max_ms']:.6f} "
+            f"speedup_vs_dense={row['speedup_vs_dense']:.4f}x "
+            f"dense_equivalent_tflops={row['dense_equivalent_tflops']:.3f} "
+            f"max_abs_vs_dense={row['max_abs_vs_dense']:.6g} "
+            f"relative_l2_vs_dense={row['relative_l2_vs_dense']:.6g}"
+        )
+    return rows
+
+
+def main() -> None:
+    args = parse_args()
+    cases = selected_cases(args)
+    validate_args(args, cases)
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        raise RuntimeError("This benchmark requires an SM120 GPU")
+
     print("SM120_SKIP_SOFTMAX_BENCHMARK")
     print(f"torch={torch.__version__} cuda={torch.version.cuda}")
     print(
         f"gpu={torch.cuda.get_device_name()} capability={torch.cuda.get_device_capability()}"
     )
     print(
-        "config="
-        f"batch={args.batch_size},q_len={args.q_len},kv_len={args.kv_len},"
-        f"hq={args.num_q_heads},hkv={args.num_kv_heads},d={args.head_dim},"
-        f"warmup={args.warmup},repeat={args.repeat},seed={args.seed}"
+        f"preset={args.preset} cases={len(cases)} warmup={args.warmup} "
+        f"repeat={args.repeat} seed={args.seed} active_skip_factor={args.skip_scale_factor}"
     )
-    print(
-        "correctness="
-        f"skip_no_tiles_max_abs={no_tiles_max_abs:.6g},"
-        f"skip_no_tiles_rel_l2={no_tiles_rel_l2:.6g},"
-        f"skip_active_max_abs={active_max_abs:.6g},"
-        f"skip_active_rel_l2={active_rel_l2:.6g}"
-    )
-    dense_ms = medians["dense"]
-    for name in thresholds:
-        values = timings[name]
-        median_ms = medians[name]
-        print(
-            f"mode={name} threshold={thresholds[name]} median_ms={median_ms:.6f} "
-            f"min_ms={min(values):.6f} max_ms={max(values):.6f} "
-            f"speedup_vs_dense={dense_ms / median_ms:.4f}x"
+    print("active_mode_data=synthetic_skip_friendly_upper_bound")
+    print("timing=CUPTI_preferred_CUDA_events_fallback warm_L2")
+
+    rows = []
+    for index, case in enumerate(cases):
+        print(f"CASE_START {index + 1}/{len(cases)} {case.name}", flush=True)
+        rows.extend(
+            benchmark_case(
+                case,
+                skip_scale_factor=args.skip_scale_factor,
+                warmup=args.warmup,
+                repeat=args.repeat,
+                seed=args.seed,
+            )
         )
+        torch.cuda.empty_cache()
+
+    if args.csv is not None:
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        with args.csv.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=tuple(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"CSV={args.csv}")
+    print(f"SM120_SKIP_SOFTMAX_BENCHMARK: PASS ({len(cases)} cases)")
 
 
 if __name__ == "__main__":

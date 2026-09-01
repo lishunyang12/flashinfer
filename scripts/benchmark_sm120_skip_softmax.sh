@@ -13,6 +13,16 @@ validation_overlay="${VALIDATION_OVERLAY:-${repo_parent}/.flashinfer-sm120-valid
 export FLASHINFER_WORKSPACE_BASE="${JIT_CACHE_BASE:-${repo_parent}/.flashinfer-sm120-jit}"
 result_base="${RESULT_BASE:-${repo_parent}/sm120-skip-benchmark-results}"
 result_root="${result_base}/$(date -u +%Y%m%dT%H%M%SZ)"
+telemetry_pid=""
+
+cleanup() {
+  if [[ -n "${telemetry_pid}" ]] && kill -0 "${telemetry_pid}" 2>/dev/null; then
+    kill "${telemetry_pid}" 2>/dev/null || true
+    wait "${telemetry_pid}" 2>/dev/null || true
+  fi
+}
+
+trap cleanup EXIT
 
 mkdir -p "${result_root}" "${FLASHINFER_WORKSPACE_BASE}"
 exec > >(tee "${result_root}/benchmark.log") 2>&1
@@ -47,7 +57,12 @@ fi
 nvidia-smi -i "${gpu_id}" \
   --query-gpu=index,name,compute_cap,driver_version,memory.used,memory.total,utilization.gpu \
   --format=csv,noheader
+nvidia-smi -i "${gpu_id}" \
+  --query-gpu=timestamp,index,temperature.gpu,utilization.gpu,clocks.sm,power.draw,memory.used \
+  --format=csv,noheader,nounits --loop-ms=1000 >"${result_root}/gpu_telemetry.csv" &
+telemetry_pid="$!"
 
 validation_pythonpath="${repo_root}:${validation_overlay}${PYTHONPATH:+:${PYTHONPATH}}"
 CUDA_VISIBLE_DEVICES="${gpu_id}" PYTHONPATH="${validation_pythonpath}" \
-  "${base_python}" "${repo_root}/benchmarks/bench_sm120_skip_softmax.py" "$@"
+  "${base_python}" "${repo_root}/benchmarks/bench_sm120_skip_softmax.py" \
+  --csv "${result_root}/benchmark.csv" "$@"
