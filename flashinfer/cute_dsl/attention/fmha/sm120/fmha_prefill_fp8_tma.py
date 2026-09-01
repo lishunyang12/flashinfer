@@ -952,8 +952,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         for i in cutlass.range_constexpr(self.qk_k_frags * 4):
             s_regs[i] = cutlass.Float32(0.0)
         tile_row_max = cutlass.Array(cutlass.Float32, 2, alignment=16)
+        tile_row_max_alt = cutlass.Array(cutlass.Float32, 2, alignment=16)
         for row_half in cutlass.range_constexpr(2):
             tile_row_max[row_half] = -cutlass.Float32.inf
+            if cutlass.const_expr(tracks_tile_row_max):
+                tile_row_max_alt[row_half] = -cutlass.Float32.inf
 
         k_row_in_frag_pair = (basic_params.lane_div8 // 2) * 8 + basic_params.lane_mod8
         k_col_in_frag_pair = (basic_params.lane_div8 % 2) * 16
@@ -1017,14 +1020,24 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         previous_k_frag = previous_k_block * 4 + previous_k_in_block
                         previous_s_off = previous_k_frag * 4
                         for row_half in cutlass.range_constexpr(2):
-                            tile_row_max[row_half] = cute.arch.fmax(
-                                tile_row_max[row_half],
-                                s_regs[previous_s_off + row_half * 2],
-                            )
-                            tile_row_max[row_half] = cute.arch.fmax(
-                                tile_row_max[row_half],
-                                s_regs[previous_s_off + row_half * 2 + 1],
-                            )
+                            if cutlass.const_expr(previous_k_block % 2 == 0):
+                                tile_row_max[row_half] = cute.arch.fmax(
+                                    tile_row_max[row_half],
+                                    s_regs[previous_s_off + row_half * 2],
+                                )
+                                tile_row_max[row_half] = cute.arch.fmax(
+                                    tile_row_max[row_half],
+                                    s_regs[previous_s_off + row_half * 2 + 1],
+                                )
+                            else:
+                                tile_row_max_alt[row_half] = cute.arch.fmax(
+                                    tile_row_max_alt[row_half],
+                                    s_regs[previous_s_off + row_half * 2],
+                                )
+                                tile_row_max_alt[row_half] = cute.arch.fmax(
+                                    tile_row_max_alt[row_half],
+                                    s_regs[previous_s_off + row_half * 2 + 1],
+                                )
                 if cutlass.const_expr(
                     d_frag == 0 and k_block + 1 < self.qk_k_frags // 4
                 ):
@@ -1048,15 +1061,32 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     last_k_frag = last_k_block * 4 + last_k_in_block
                     last_s_off = last_k_frag * 4
                     for row_half in cutlass.range_constexpr(2):
-                        tile_row_max[row_half] = cute.arch.fmax(
-                            tile_row_max[row_half],
-                            s_regs[last_s_off + row_half * 2],
-                        )
-                        tile_row_max[row_half] = cute.arch.fmax(
-                            tile_row_max[row_half],
-                            s_regs[last_s_off + row_half * 2 + 1],
-                        )
+                        if cutlass.const_expr(last_k_block % 2 == 0):
+                            tile_row_max[row_half] = cute.arch.fmax(
+                                tile_row_max[row_half],
+                                s_regs[last_s_off + row_half * 2],
+                            )
+                            tile_row_max[row_half] = cute.arch.fmax(
+                                tile_row_max[row_half],
+                                s_regs[last_s_off + row_half * 2 + 1],
+                            )
+                        else:
+                            tile_row_max_alt[row_half] = cute.arch.fmax(
+                                tile_row_max_alt[row_half],
+                                s_regs[last_s_off + row_half * 2],
+                            )
+                            tile_row_max_alt[row_half] = cute.arch.fmax(
+                                tile_row_max_alt[row_half],
+                                s_regs[last_s_off + row_half * 2 + 1],
+                            )
             k_cur = k_next
+
+        if cutlass.const_expr(tracks_tile_row_max):
+            for row_half in cutlass.range_constexpr(2):
+                tile_row_max[row_half] = cute.arch.fmax(
+                    tile_row_max[row_half],
+                    tile_row_max_alt[row_half],
+                )
 
         return s_regs, tile_row_max
 
