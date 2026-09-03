@@ -613,6 +613,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         Q_smem_layout: cute.ComposedLayout,
         K_smem_layout: cute.ComposedLayout,
         V_smem_layout: cute.ComposedLayout,
+        P_smem_layout: cute.ComposedLayout,
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
     ):
