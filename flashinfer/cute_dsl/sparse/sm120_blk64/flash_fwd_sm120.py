@@ -984,12 +984,11 @@ def rescale_o_for_next_acc(
     tOrO: cute.ThrMma,
     prev_ratio_m: cute.Tensor,
 ):
-    thread_has_unit_scale = cutlass.Boolean(True)
-    for m in cutlass.range(cute.size(prev_ratio_m), unroll_full=True):
-        thread_has_unit_scale = thread_has_unit_scale and prev_ratio_m[m] == 1.0
-    warp_has_unit_scale = cute.arch.vote_all_sync(thread_has_unit_scale)
-
     tOrO_mn = layout_utils.reshape_acc_to_mn(tOrO)
-    if not warp_has_unit_scale:
-        for m in cutlass.range(cute.size(prev_ratio_m), unroll_full=True):
+    for m in cutlass.range(cute.size(prev_ratio_m), unroll_full=True):
+        # Each logical output row is owned by a stable four-lane MMA group.
+        # Branch per row group so rows whose running max did not change avoid
+        # touching the full output fragment even when another row in the warp
+        # still needs rescaling.
+        if prev_ratio_m[m] != 1.0:
             tOrO_mn[m, None].store(tOrO_mn[m, None].load() * prev_ratio_m[m])
