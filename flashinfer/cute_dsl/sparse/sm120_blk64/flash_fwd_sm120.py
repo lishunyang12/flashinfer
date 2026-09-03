@@ -270,7 +270,6 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         tSsQ = thr_mma_qk.partition_A(sQ)
         tSsK = thr_mma_qk.partition_B(sK)
         tSrQ = tiled_mma_qk.make_fragment_A(tSsQ[None, None, None, 0])
-        tSrK = tiled_mma_qk.make_fragment_B(tSsK[None, None, None, 0])
         tSrS = cute.make_rmem_tensor(
             thr_mma_qk.partition_shape_C(
                 (self.tile_shape_qk[0], self.tile_shape_qk[1])
@@ -281,7 +280,6 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
         tOsV = thr_mma_pv.partition_B(sV)
-        tOrV = tiled_mma_pv.make_fragment_B(tOsV[None, None, None, 0])
         tOrO = cute.make_rmem_tensor(
             thr_mma_pv.partition_shape_C(
                 (self.tile_shape_pv[0], self.tile_shape_pv[1])
@@ -413,6 +411,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             K_pipeline.consumer_wait(K_consumer_state, K_wait_status)
 
             k_stage = K_consumer_state.index
+            tSrK = tiled_mma_qk.make_fragment_B(tSsK[None, None, None, 0])
 
             gemm_smem_zero_acc(
                 tiled_mma_qk,
@@ -501,6 +500,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
                     V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
                     v_stage = V_consumer_state.index
+                    tOrV = tiled_mma_pv.make_fragment_B(tOsV[None, None, None, 0])
                     gemm_rs_smem(
                         tiled_mma_pv,
                         tOrO,
@@ -515,6 +515,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
                 V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
                 v_stage = V_consumer_state.index
+                tOrV = tiled_mma_pv.make_fragment_B(tOsV[None, None, None, 0])
                 gemm_rs_smem(
                     tiled_mma_pv,
                     tOrO,
