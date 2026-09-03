@@ -1448,6 +1448,12 @@ def rescale_o_for_next_acc(
     tOrO: cute.ThrMma,
     prev_ratio_m: cute.Tensor,
 ):
-    tOrO_mn = layout_utils.reshape_acc_to_mn(tOrO)
+    thread_has_unit_scale = cutlass.Boolean(True)
     for m in cutlass.range(cute.size(prev_ratio_m), unroll_full=True):
-        tOrO_mn[m, None].store(tOrO_mn[m, None].load() * prev_ratio_m[m])
+        thread_has_unit_scale = thread_has_unit_scale and prev_ratio_m[m] == 1.0
+    warp_has_unit_scale = cute.arch.vote_all_sync(thread_has_unit_scale)
+
+    tOrO_mn = layout_utils.reshape_acc_to_mn(tOrO)
+    if not warp_has_unit_scale:
+        for m in cutlass.range(cute.size(prev_ratio_m), unroll_full=True):
+            tOrO_mn[m, None].store(tOrO_mn[m, None].load() * prev_ratio_m[m])
