@@ -551,8 +551,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                         local_max, threads_in_group=4
                     )
                     row_coord = tScS_mn[m, 0][0]
-                    n_coord = tScS_mn[m, 0][1]
-                    if n_coord == n_group * (self.tile_size // 2):
+                    if lane_idx % 4 == 0:
                         row_exchange[n_group, row_coord] = local_max
 
                 self.split_n_cta_barrier.arrive_and_wait()
@@ -698,8 +697,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             n_group = warp_idx // 4
             for m in cutlass.range(cute.size(sum_m), unroll_full=True):
                 row_coord = tScS_mn[m, 0][0]
-                n_coord = tScS_mn[m, 0][1]
-                if n_coord == n_group * (self.tile_size // 2):
+                if lane_idx % 4 == 0:
                     row_exchange[n_group, row_coord] = sum_m_reduced_rmem[m]
             self.split_n_cta_barrier.arrive_and_wait()
 
