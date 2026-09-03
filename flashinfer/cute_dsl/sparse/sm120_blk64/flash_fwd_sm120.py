@@ -918,10 +918,13 @@ def online_softmax(
             acc_S_row * softmax_scale_log2e - row_max_scaled,
             fastmath=True,
         )
-        row_scale[m] = cute.math.exp2(
-            (row_max_prev - row_max_safe) * softmax_scale_log2e,
-            fastmath=True,
-        )
+        if row_max_prev == row_max_cur and row_max_cur != -cutlass.Float32.inf:
+            row_scale[m] = 1.0
+        else:
+            row_scale[m] = cute.math.exp2(
+                (row_max_prev - row_max_safe) * softmax_scale_log2e,
+                fastmath=True,
+            )
         row_sum[m] = kernel_utils.fadd_reduce(
             acc_S_row_exp,
             init_val=row_sum[m] * row_scale[m],
@@ -968,4 +971,5 @@ def rescale_o_for_next_acc(
 ):
     tOrO_mn = layout_utils.reshape_acc_to_mn(tOrO)
     for m in cutlass.range(cute.size(prev_ratio_m), unroll_full=True):
-        tOrO_mn[m, None].store(tOrO_mn[m, None].load() * prev_ratio_m[m])
+        if prev_ratio_m[m] != 1.0:
+            tOrO_mn[m, None].store(tOrO_mn[m, None].load() * prev_ratio_m[m])
