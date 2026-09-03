@@ -181,7 +181,7 @@ __device__ __forceinline__ void zero_output(bf16* output, int batch_idx,
   }
 }
 
-__global__ __maxnreg__(200) void vsa_bf16_h3_kernel(
+__global__ __launch_bounds__(kThreads, 2) void vsa_bf16_h3_kernel(
     const bf16* __restrict__ q, const bf16* __restrict__ k,
     const bf16* __restrict__ v, bf16* __restrict__ output,
     const int32_t* __restrict__ indices, const int32_t* __restrict__ block_nums,
@@ -454,6 +454,10 @@ void run(TensorView q, TensorView k, TensorView v, TensorView output,
   const auto kernel = vsa_bf16_h3_kernel;
   auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      static_cast<int>(smem_bytes));
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cudaFuncSetAttribute failed: " << cudaGetErrorString(status);
+  status = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                cudaSharedmemCarveoutMaxShared);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "cudaFuncSetAttribute failed: " << cudaGetErrorString(status);
   const cudaStream_t stream = get_stream(q.device());
