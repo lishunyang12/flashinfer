@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -234,6 +235,36 @@ def bsa_attn_sm120_blk64_fwd(
         num_kv_blocks=num_kv_blocks,
         device=q.device,
     )
+
+    use_native_pipeline = (
+        os.environ.get("FLASHINFER_SM120_VSA_NATIVE_PIPELINE") == "1"
+        and arch == 120
+        and q.dtype == torch.bfloat16
+        and not return_lse
+        and skip_threshold_log2 is None
+        and gqa_ratio == 1
+        and has_block_nums
+        and has_block_sizes
+        and block_sizes_mode == 1
+        and seqlen_q >= 65536
+        and seqlen_q % _BLOCK_SIZE == 0
+        and seqlen_k % _BLOCK_SIZE == 0
+    )
+    if use_native_pipeline:
+        from flashinfer.jit.sm120_vsa_native import (  # noqa: PLC0415
+            load_sm120_vsa_native_module,
+        )
+
+        load_sm120_vsa_native_module().sm120_vsa_native_run(
+            q,
+            k,
+            v,
+            out,
+            q2k_t,
+            q2k_nums_t,
+            float(softmax_scale),
+        )
+        return out, None
 
     # Transpose from BSHD to the layout expected by the sm120 kernel:
     # Q/K/O: (B,S,H,D) -> (S,D,H,B), leading_dim=1 (D stride=1 preserved as view)
