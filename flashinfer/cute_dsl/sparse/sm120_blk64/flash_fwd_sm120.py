@@ -62,8 +62,6 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.kv_stage = 1
         self.q_stage = 1
         self.p_stage = 2
-        self.p_elements_per_thread = 32
-        self.softmax_rows_per_thread = 2
         self.skip_softmax_cta_barrier = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=self.num_threads,
@@ -116,6 +114,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         Q_smem_layout: cute.ComposedLayout,
         K_smem_layout: cute.ComposedLayout,
         V_smem_layout: cute.ComposedLayout,
+        P_smem_layout: cute.ComposedLayout,
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
         skip_softmax_threshold_log2: cutlass.Float32 | None,
@@ -700,18 +699,18 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         sV = shared_storage.V_smem.get_tensor(
             V_smem_layout.outer, swizzle=V_smem_layout.inner
         )
-        sP = shared_storage.Q_smem.get_tensor(
-            cute.make_layout(
-                (128, self.p_elements_per_thread, self.p_stage)
-            )
+        sP = cute.make_tensor(
+            cute.recast_ptr(
+                cute.recast_ptr(sQ.iterator, dtype=self.K_dtype),
+                P_smem_layout.inner,
+            ),
+            P_smem_layout.outer,
         )
         sRowScale = shared_storage.row_scale.get_tensor(
-            cute.make_layout(
-                (128, self.softmax_rows_per_thread, self.p_stage)
-            )
+            cute.make_layout((self.p_stage, self.tile_size))
         )
         sFinalScale = shared_storage.final_scale.get_tensor(
-            cute.make_layout((128, self.softmax_rows_per_thread))
+            cute.make_layout((self.tile_size,))
         )
 
         mO_slice = mO[None, None, work_desc.qo_head_idx, work_desc.batch_idx]
@@ -820,6 +819,22 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 self.acc_dtype,
             )
             tScS = thr_mma_qk.partition_C(cS)
+            tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
+
+            # Publish each BF16 P tile with stmatrix into one of two stages
+            # aliased over the now-dead Q allocation.
+            tPrP_frg = cute.make_rmem_tensor_like(tSrS, self.K_dtype)
+            tiled_copy_p_r2s = cute.make_tiled_copy_C(
+                cute.make_copy_atom(
+                    cute.nvgpu.warp.StMatrix8x8x16bOp(
+                        self.Q_layout.is_m_major_c(), 4
+                    ),
+                    self.K_dtype,
+                ),
+                tiled_mma_qk,
+            )
+            tPrP_store = tiled_copy_p_r2s.retile(tPrP_frg)
+            tPsP_store = tiled_copy_p_r2s.get_slice(local_tidx).partition_D(sP)
 
             atom_copy_q = cute.make_copy_atom(
                 cute.nvgpu.warp.LdMatrix8x8x16bOp(self.Q_layout.is_m_major_a(), 4),
@@ -900,13 +915,16 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 row_scale = online_softmax(
                     tSrS, max_m, sum_m, scale_softmax_log2e
                 )
-                tP = cute.make_rmem_tensor_like(tSrS, self.K_dtype)
-                tP.store(tSrS.load().to(self.K_dtype))
+                tPrP_frg.store(tSrS.load().to(self.K_dtype))
                 p_handle = P_producer.acquire_and_advance()
-                for i in cutlass.range_constexpr(cute.size(tP)):
-                    sP[local_tidx, i, p_handle.index] = tP[i]
-                for i in cutlass.range_constexpr(cute.size(row_scale)):
-                    sRowScale[local_tidx, i, p_handle.index] = row_scale[i]
+                cute.copy(
+                    tiled_copy_p_r2s,
+                    tPrP_store,
+                    tPsP_store[None, None, None, p_handle.index],
+                )
+                for m in cutlass.range_constexpr(cute.size(row_scale)):
+                    if tScS_mn[m, 0][1] == 0:
+                        sRowScale[p_handle.index, tScS_mn[m, 0][0]] = row_scale[m]
                 cute.arch.fence_view_async_shared()
                 p_handle.commit()
 
@@ -923,24 +941,20 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     V_pipeline.producer_commit(V_producer_state)
                     V_producer_state.advance()
 
-            final_ratio, lse = finalize_softmax(
-                max_m, sum_m, scale_softmax_log2e
-            )
-            for i in cutlass.range_constexpr(cute.size(final_ratio)):
-                sFinalScale[local_tidx, i] = final_ratio[i]
-            tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
-            for m in cutlass.range_constexpr(cute.size(lse)):
-                row_idx = work_desc.qo_tile_idx * self.tile_size + tScS_mn[m, 0][0]
-                if tScS_mn[m, 0][1] == 0 and row_idx < mQ.shape[0]:
-                    mLSE_slice[row_idx] = lse[m]
+            final_ratio = finalize_softmax(sum_m)
+            for m in cutlass.range_constexpr(cute.size(final_ratio)):
+                if tScS_mn[m, 0][1] == 0:
+                    sFinalScale[tScS_mn[m, 0][0]] = final_ratio[m]
             cute.arch.fence_view_async_shared()
             P_producer.tail()
             cute.arch.sync_threads()
 
         else:
             local_tidx = tidx - 128
-            thr_mma_qk = tiled_mma_qk.get_slice(local_tidx)
             thr_mma_pv = tiled_mma_pv.get_slice(local_tidx)
+            cO = cute.make_identity_tensor(self.tile_shape_pv[:2])
+            tOcO = thr_mma_pv.partition_C(cO)
+            tOcO_mn = layout_utils.reshape_acc_to_mn(tOcO)
             tOsV = thr_mma_pv.partition_B(sV)
             tOrV = tiled_mma_pv.make_fragment_B(tOsV[None, None, None, 0])
             tOrO = cute.make_rmem_tensor(
@@ -948,13 +962,26 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 self.acc_dtype,
             )
             tOrO.store(cute.full_like(tOrO, 0.0, self.acc_dtype))
-            tP_frg = cute.make_rmem_tensor(
-                thr_mma_qk.partition_shape_C(self.tile_shape_qk[:2]),
+
+            tPsP = thr_mma_pv.partition_A(sP)
+            tPrP = tiled_mma_pv.make_fragment_A(tPsP[None, None, None, 0])
+            atom_copy_p = cute.make_copy_atom(
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                    self.Q_layout.is_m_major_a(), 4
+                ),
                 self.K_dtype,
             )
-            tOrP = layout_utils.reshape_acc_to_frgA(tP_frg)
+            smem_tiled_copy_p = cute.make_tiled_copy_A(atom_copy_p, tiled_mma_pv)
+            thr_copy_p = smem_tiled_copy_p.get_slice(local_tidx)
+            tPsP_copy = thr_copy_p.partition_S(sP)
+            tPrP_copy = thr_copy_p.retile(tPrP)
+
             row_scale = cute.make_rmem_tensor(
-                cute.make_layout((self.softmax_rows_per_thread,)),
+                cute.make_layout(
+                    cute.size(
+                        layout_utils.reshape_acc_to_mn(tOrO).layout, mode=[0]
+                    )
+                ),
                 cutlass.Float32,
             )
             atom_copy_v = cute.make_copy_atom(
@@ -967,10 +994,21 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             cute.arch.sync_threads()
             for _ in cutlass.range(0, num_n_tiles, 1, unroll=1):
                 p_handle = P_consumer.wait_and_advance()
-                for i in cutlass.range_constexpr(cute.size(tP_frg)):
-                    tP_frg[i] = sP[local_tidx, i, p_handle.index]
-                for i in cutlass.range_constexpr(cute.size(row_scale)):
-                    row_scale[i] = sRowScale[local_tidx, i, p_handle.index]
+                for k_block_idx in cutlass.range_constexpr(
+                    cute.size(tPrP, mode=[2])
+                ):
+                    cute.copy(
+                        smem_tiled_copy_p,
+                        tPsP_copy[
+                            None, None, k_block_idx, p_handle.index
+                        ],
+                        tPrP_copy[None, None, k_block_idx],
+                    )
+                for m in cutlass.range_constexpr(cute.size(row_scale)):
+                    row_scale[m] = sRowScale[
+                        p_handle.index, tOcO_mn[m, 0][0]
+                    ]
+                p_handle.release()
 
                 v_wait = V_pipeline.consumer_try_wait(V_consumer_state)
                 V_pipeline.consumer_wait(V_consumer_state, v_wait)
@@ -979,19 +1017,18 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 gemm_rs_smem(
                     tiled_mma_pv,
                     tOrO,
-                    tOrP,
+                    tPrP,
                     tOrV,
                     tOsV_copy[None, None, None, v_stage],
                     smem_tiled_copy_v,
                 )
                 V_pipeline.consumer_release(V_consumer_state)
                 V_consumer_state.advance()
-                p_handle.release()
 
             cute.arch.sync_threads()
             final_ratio = cute.make_rmem_tensor_like(row_scale, cutlass.Float32)
-            for i in cutlass.range_constexpr(cute.size(final_ratio)):
-                final_ratio[i] = sFinalScale[local_tidx, i]
+            for m in cutlass.range_constexpr(cute.size(final_ratio)):
+                final_ratio[m] = sFinalScale[tOcO_mn[m, 0][0]]
             rescale_o_for_next_acc(tOrO, final_ratio)
 
             tOrO_cvt = cute.make_rmem_tensor_like(tOrO, self.O_dtype)
@@ -1073,9 +1110,13 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.check_dim([mQ, mK, mO], 1)
         self.check_dim(mV, 0)
 
-        use_warp_pipeline = skip_softmax_threshold_log2 is None
+        use_warp_pipeline = (
+            skip_softmax_threshold_log2 is None
+            and not self.return_lse
+            and self.dtype == cutlass.BFloat16
+        )
         self.num_threads = 256 if use_warp_pipeline else 128
-        self.kv_stage = 2 if use_warp_pipeline else 1
+        self.kv_stage = 1
 
         Q_layout = utils.LayoutEnum.from_tensor(mQ)
         K_layout = utils.LayoutEnum.from_tensor(mK)
@@ -1109,6 +1150,12 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             self.V_dtype,
             self.kv_stage,
         )
+        self.P_smem_layout = sm90_utils.make_smem_layout_a(
+            Q_layout,
+            self.tile_shape_pv,
+            self.K_dtype,
+            self.p_stage,
+        )
         O_smem_layout_staged = sm90_utils.make_smem_layout_epi(
             self.O_dtype,
             O_layout,
@@ -1127,12 +1174,9 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 cutlass.Int8, self.num_threads // 32
             ]
             row_scale: cute.struct.MemRange[
-                cutlass.Float32,
-                128 * self.softmax_rows_per_thread * self.p_stage,
+                cutlass.Float32, self.p_stage * self.tile_size
             ]
-            final_scale: cute.struct.MemRange[
-                cutlass.Float32, 128 * self.softmax_rows_per_thread
-            ]
+            final_scale: cute.struct.MemRange[cutlass.Float32, self.tile_size]
 
             Q_smem: cute.struct.Align[
                 cute.struct.MemRange[self.Q_dtype, cute.cosize(self.Q_smem_layout)], 128
@@ -1229,6 +1273,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 self.Q_smem_layout,
                 self.K_smem_layout,
                 self.V_smem_layout,
+                self.P_smem_layout,
                 self.O_smem_layout,
                 softmax_scale * log2_e,
             ).launch(
@@ -1237,7 +1282,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 cluster=(1, 1, 1),
                 smem=self.shared_storage_t.size_in_bytes(),  # type: ignore[attr-defined]
                 stream=stream,
-                min_blocks_per_mp=1,
+                min_blocks_per_mp=2,
             )
         else:
             self.kernel_sequential(
