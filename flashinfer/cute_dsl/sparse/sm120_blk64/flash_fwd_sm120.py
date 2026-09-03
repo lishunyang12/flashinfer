@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import operator
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -20,11 +21,38 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import cuda.bindings.driver as cuda
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import Int32, dsl_user_op
 from . import layout_utils
 from . import kernel_utils
 from .batched_static_scheduler import BatchedStaticSchedulerMixin
 
 SM120_FWD_BLOCK_SIZE = 64
+
+
+@dsl_user_op
+def _nanosleep(
+    sleep_time: int,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Emit nanosleep on CuTe DSL versions without the arch wrapper."""
+    if cutlass.const_expr(hasattr(cute.arch, "nanosleep")):
+        cute.arch.nanosleep(sleep_time=sleep_time, loc=loc, ip=ip)
+    else:
+        llvm.inline_asm(
+            res=None,
+            operands_=[Int32(sleep_time).ir_value(loc=loc, ip=ip)],
+            asm_string="nanosleep.u32 $0;",
+            constraints="r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
 
 
 # =============================================================================
@@ -112,6 +140,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
         skip_softmax_threshold_log2: cutlass.Float32 | None,
+        cta_stagger_ns: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
@@ -127,6 +156,11 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_K)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_V)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_O)
+
+        # Offset adjacent head CTAs once so the two resident CTAs do not enter
+        # scalar softmax gaps in lockstep. Zero preserves the baseline schedule.
+        if cta_stagger_ns > 0 and work_desc.qo_head_idx % 2 == 1:
+            _nanosleep(cta_stagger_ns)
 
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
@@ -596,6 +630,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         blocksparse_varblk: cute.Tensor,
         softmax_scale: cutlass.Float32,
         skip_softmax_threshold_log2: cutlass.Float32 | None,
+        cta_stagger_ns: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         # Restore compile-time head dimensions while keeping runtime tensor modes dynamic.
@@ -773,6 +808,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             self.O_smem_layout,
             softmax_scale * log2_e,
             skip_softmax_threshold_log2,
+            cta_stagger_ns,
         ).launch(
             grid=grid_config,
             block=block_config,

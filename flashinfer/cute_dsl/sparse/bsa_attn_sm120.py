@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -171,6 +172,13 @@ def bsa_attn_sm120_blk64_fwd(
 
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
+
+    cta_stagger_ns = int(os.environ.get("FLASHINFER_SM120_VSA_STAGGER_NS", "0"))
+    if not 0 <= cta_stagger_ns <= 100_000:
+        raise ValueError(
+            "FLASHINFER_SM120_VSA_STAGGER_NS must be between 0 and 100000; "
+            f"got {cta_stagger_ns}"
+        )
     skip_threshold_log2 = None
     if skip_softmax_threshold_scale_factor not in (None, 0):
         skip_softmax_threshold_scale_factor = float(skip_softmax_threshold_scale_factor)
@@ -321,6 +329,7 @@ def bsa_attn_sm120_blk64_fwd(
         block_sizes_cute,
         cutlass.Float32(softmax_scale),
         skip_threshold_log2,
+        cutlass.Int32(cta_stagger_ns),
         current_stream,
     )
 
