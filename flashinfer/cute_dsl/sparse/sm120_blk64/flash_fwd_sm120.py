@@ -922,10 +922,13 @@ def online_softmax(
             acc_S_row * softmax_scale_log2e - row_max_scaled,
             fastmath=True,
         )
-        row_scale[m] = cute.math.exp2(
-            (row_max_prev - row_max_safe) * softmax_scale_log2e,
-            fastmath=True,
-        )
+        if row_max_prev == row_max_cur and row_max_cur != -cutlass.Float32.inf:
+            row_scale[m] = 1.0
+        else:
+            row_scale[m] = cute.math.exp2(
+                (row_max_prev - row_max_safe) * softmax_scale_log2e,
+                fastmath=True,
+            )
         row_sum[m] = kernel_utils.fadd_reduce(
             acc_S_row_exp,
             init_val=row_sum[m] * row_scale[m],
