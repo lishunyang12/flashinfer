@@ -209,8 +209,10 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         # partition tensors
         sQ = cute.make_tensor(
             cute.recast_ptr(
-                shared_storage.Q_smem.data_ptr()
-                + work_group * cute.cosize(Q_smem_layout),
+                (
+                    shared_storage.Q_smem.data_ptr()
+                    + work_group * cute.cosize(Q_smem_layout)
+                ).align(16),
                 Q_smem_layout.inner,
                 dtype=self.Q_dtype,
             ),
@@ -218,8 +220,10 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         )
         sK = cute.make_tensor(
             cute.recast_ptr(
-                shared_storage.K_smem.data_ptr()
-                + work_group * cute.cosize(K_smem_layout),
+                (
+                    shared_storage.K_smem.data_ptr()
+                    + work_group * cute.cosize(K_smem_layout)
+                ).align(16),
                 K_smem_layout.inner,
                 dtype=self.K_dtype,
             ),
@@ -227,8 +231,10 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         )
         sV = cute.make_tensor(
             cute.recast_ptr(
-                shared_storage.V_smem.data_ptr()
-                + work_group * cute.cosize(V_smem_layout),
+                (
+                    shared_storage.V_smem.data_ptr()
+                    + work_group * cute.cosize(V_smem_layout)
+                ).align(16),
                 V_smem_layout.inner,
                 dtype=self.V_dtype,
             ),
@@ -603,8 +609,10 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         # Re-verify if O tile shape, O dtype, or PV warp layout ever changes.
         sO = cute.make_tensor(
             cute.recast_ptr(
-                shared_storage.Q_smem.data_ptr()
-                + work_group * cute.cosize(O_smem_layout),
+                (
+                    shared_storage.Q_smem.data_ptr()
+                    + work_group * cute.cosize(O_smem_layout)
+                ).align(16),
                 O_smem_layout.inner,
                 dtype=self.O_dtype,
             ),
