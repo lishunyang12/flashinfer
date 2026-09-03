@@ -205,7 +205,7 @@ def bsa_attn_sm120_blk64_fwd(
         )
     if lse is not None:
         assert lse.dtype == torch.float32, (
-            f"lse.dtype ({lse.dtype}) must be float32: the kernel always writes LSE in float32"
+            f"lse.dtype ({lse.dtype}) must be float32"
         )
         assert lse.shape == (batch, num_heads, seqlen_q), (
             f"lse.shape {tuple(lse.shape)} must be "
@@ -284,6 +284,7 @@ def bsa_attn_sm120_blk64_fwd(
         has_block_sizes=has_block_sizes,
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
+        return_lse=return_lse,
     )
 
     compile_key = (
@@ -296,6 +297,7 @@ def bsa_attn_sm120_blk64_fwd(
         bool(has_block_nums),
         bool(has_block_sizes),
         int(block_sizes_mode),
+        bool(return_lse),
         q_t.stride(),
         k_t.stride(),
         v_t.stride(),
