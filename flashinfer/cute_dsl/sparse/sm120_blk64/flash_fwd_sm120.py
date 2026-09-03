@@ -875,7 +875,7 @@ def should_skip_softmax(
     for m in cutlass.range(cute.size(row_max), unroll_full=True):
         tile_row_max = kernel_utils.fmax_reduce(
             tSrS_mn[m, None].load(),
-            arch=80,
+            arch=120,
         )
         tile_row_max = cute.arch.warp_reduction_max(tile_row_max, threads_in_group=4)
         row_wants_skip = cutlass.Boolean(False)
@@ -903,7 +903,7 @@ def online_softmax(
         row_max_cur = kernel_utils.fmax_reduce(
             acc_S_row,
             init_val=row_max[m],
-            arch=80,
+            arch=120,
         )
         row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
 
@@ -925,7 +925,7 @@ def online_softmax(
         row_sum[m] = kernel_utils.fadd_reduce(
             acc_S_row_exp,
             init_val=row_sum[m] * row_scale[m],
-            arch=80,
+            arch=120,
         )
         tSrS_mn[m, None].store(acc_S_row_exp)
 
