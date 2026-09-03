@@ -44,6 +44,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         has_block_nums: bool = True,
         block_sizes_mode: int = 0,
         return_lse: bool = False,
+        use_q128_shift: bool = False,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -53,12 +54,14 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         assert self.acc_dtype in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]
 
         self.tile_size = 64
+        self.use_q128_shift = use_q128_shift
+        self.q_tile_size = 128 if self.use_q128_shift else 64
 
         assert blocksparse_blocksize_q == 64, (
             "Only block_size_m=64 is supported in this kernel."
         )
         assert blocksparse_blocksize_k in [64], "block_size_n should be one of [64]"
-        self.num_threads = 128
+        self.num_threads = 256 if self.use_q128_shift else 128
         self.kv_stage = 1
         self.q_stage = 1
         self.skip_softmax_cta_barrier = pipeline.NamedBarrier(
@@ -72,8 +75,8 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.gqa_ratio = gqa_ratio
         self.qk_dim = head_dim
         self.value_dim = value_dim
-        self.tile_shape_qk = (self.tile_size, self.tile_size, self.qk_dim)
-        self.tile_shape_pv = (self.tile_size, self.value_dim, self.tile_size)
+        self.tile_shape_qk = (self.q_tile_size, self.tile_size, self.qk_dim)
+        self.tile_shape_pv = (self.q_tile_size, self.value_dim, self.tile_size)
 
         self.has_block_sizes = has_block_sizes
         self.has_block_nums = has_block_nums
@@ -222,15 +225,49 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             mV_slice, (self.tile_shape_pv[1], self.tile_shape_pv[2]), coord=(0, None)
         )
 
+        q_block_idx = work_desc.qo_tile_idx
+        if cutlass.const_expr(self.use_q128_shift):
+            q_block_idx = work_desc.qo_tile_idx * 2
         gIndices = blocksparse_indices_q2k[
-            None, work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx
+            None, q_block_idx, work_desc.qo_head_idx, work_desc.batch_idx
         ]
         if cutlass.const_expr(self.has_block_nums):
             num_n_tiles = blocksparse_num_blocks_q2k[
-                work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx
+                q_block_idx, work_desc.qo_head_idx, work_desc.batch_idx
             ]
         else:
             num_n_tiles = block_sparse_num
+
+        # H3's long-video rows use a sliding sparse window: adjacent rows have
+        # identical prefix blocks and a one-block-shifted 64-block window. The
+        # opt-in Q128 path traverses their union once and predicates the four
+        # warps assigned to each 64-row half. Dense prefix pairs have identical
+        # lists and therefore also share every K/V transfer.
+        if cutlass.const_expr(self.use_q128_shift):
+            num_q_blocks = blocksparse_num_blocks_q2k.shape[0]
+            q_block_idx_1 = q_block_idx + 1
+            q_block_1_valid = q_block_idx_1 < num_q_blocks
+            if not q_block_1_valid:
+                q_block_idx_1 = q_block_idx
+            gIndices1 = blocksparse_indices_q2k[
+                None,
+                q_block_idx_1,
+                work_desc.qo_head_idx,
+                work_desc.batch_idx,
+            ]
+            num_n_tiles1 = blocksparse_num_blocks_q2k[
+                q_block_idx_1, work_desc.qo_head_idx, work_desc.batch_idx
+            ]
+            shifted_pair = cutlass.Boolean(False)
+            if q_block_1_valid and num_n_tiles > 0 and num_n_tiles1 == num_n_tiles:
+                shifted_pair = (
+                    gIndices[num_n_tiles - 1] != gIndices1[num_n_tiles1 - 1]
+                )
+            num_union_tiles = num_n_tiles
+            if shifted_pair:
+                num_union_tiles += 1
+        else:
+            num_union_tiles = num_n_tiles
         if cutlass.const_expr(self.has_block_sizes):
             if cutlass.const_expr(self.block_sizes_mode == 1):
                 gBSZ = blocksparse_varblk
@@ -336,9 +373,19 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             Q_producer_state.advance()
 
             preload_count = cutlass.Int32(0)
-            if preload_count < num_n_tiles:
-                logical_idx = num_n_tiles - 1 - preload_count
-                physical_idx = gIndices[logical_idx]
+            if preload_count < num_union_tiles:
+                if cutlass.const_expr(self.use_q128_shift):
+                    physical_idx, _, _ = q128_shift_union_item(
+                        gIndices,
+                        gIndices1,
+                        num_n_tiles,
+                        preload_count,
+                        shifted_pair,
+                        q_block_1_valid,
+                    )
+                else:
+                    logical_idx = num_n_tiles - 1 - preload_count
+                    physical_idx = gIndices[logical_idx]
                 K_pipeline.producer_acquire(K_producer_state)
                 cute.copy(
                     tma_atom_K,
@@ -360,9 +407,19 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     V_producer_state.advance()
             if cutlass.const_expr(self.kv_stage > 1):
                 preload_count = cutlass.Int32(1)
-                if preload_count < num_n_tiles:
-                    logical_idx = num_n_tiles - 1 - preload_count
-                    physical_idx = gIndices[logical_idx]
+                if preload_count < num_union_tiles:
+                    if cutlass.const_expr(self.use_q128_shift):
+                        physical_idx, _, _ = q128_shift_union_item(
+                            gIndices,
+                            gIndices1,
+                            num_n_tiles,
+                            preload_count,
+                            shifted_pair,
+                            q_block_1_valid,
+                        )
+                    else:
+                        logical_idx = num_n_tiles - 1 - preload_count
+                        physical_idx = gIndices[logical_idx]
                     K_pipeline.producer_acquire(K_producer_state)
                     cute.copy(
                         tma_atom_K,
@@ -399,9 +456,22 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         Q_pipeline.consumer_release(Q_consumer_state)
         Q_consumer_state.advance()
 
-        for load_count in cutlass.range(0, num_n_tiles, 1, unroll=1):
-            n_tile_ind = num_n_tiles - 1 - load_count
-            n_tile_idx = gIndices[n_tile_ind]
+        for load_count in cutlass.range(0, num_union_tiles, 1, unroll=1):
+            if cutlass.const_expr(self.use_q128_shift):
+                n_tile_idx, active_q0, active_q1 = q128_shift_union_item(
+                    gIndices,
+                    gIndices1,
+                    num_n_tiles,
+                    load_count,
+                    shifted_pair,
+                    q_block_1_valid,
+                )
+                warp_active = active_q0
+                if warp_idx >= 4:
+                    warp_active = active_q1
+            else:
+                n_tile_ind = num_n_tiles - 1 - load_count
+                n_tile_idx = gIndices[n_tile_ind]
             if cutlass.const_expr(self.has_block_sizes):
                 varblk = gBSZ[n_tile_idx]
             else:
@@ -414,23 +484,44 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
             k_stage = K_consumer_state.index
 
-            gemm_smem_zero_acc(
-                tiled_mma_qk,
-                tSrS,
-                tSrQ,
-                tSrK,
-                tSsK_copy[None, None, None, k_stage],
-                smem_tiled_copy_K,
-            )
+            if cutlass.const_expr(self.use_q128_shift):
+                if warp_active:
+                    gemm_smem_zero_acc(
+                        tiled_mma_qk,
+                        tSrS,
+                        tSrQ,
+                        tSrK,
+                        tSsK_copy[None, None, None, k_stage],
+                        smem_tiled_copy_K,
+                    )
+            else:
+                gemm_smem_zero_acc(
+                    tiled_mma_qk,
+                    tSrS,
+                    tSrQ,
+                    tSrK,
+                    tSsK_copy[None, None, None, k_stage],
+                    smem_tiled_copy_K,
+                )
 
             K_pipeline.consumer_release(K_consumer_state)
             K_consumer_state.advance()
 
             preload_count = load_count + self.kv_stage
             preload_physical = cutlass.Int32(0)
-            if warp_idx == 0 and preload_count < num_n_tiles:
-                preload_logical = num_n_tiles - 1 - preload_count
-                preload_physical = gIndices[preload_logical]
+            if warp_idx == 0 and preload_count < num_union_tiles:
+                if cutlass.const_expr(self.use_q128_shift):
+                    preload_physical, _, _ = q128_shift_union_item(
+                        gIndices,
+                        gIndices1,
+                        num_n_tiles,
+                        preload_count,
+                        shifted_pair,
+                        q_block_1_valid,
+                    )
+                else:
+                    preload_logical = num_n_tiles - 1 - preload_count
+                    preload_physical = gIndices[preload_logical]
                 K_pipeline.producer_acquire(K_producer_state)
                 cute.copy(
                     tma_atom_K,
@@ -441,8 +532,13 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 K_pipeline.producer_commit(K_producer_state)
                 K_producer_state.advance()
 
-            if varblk < self.tile_size:
-                mask(tSrS, tScS, varblk)
+            if cutlass.const_expr(self.use_q128_shift):
+                if warp_active:
+                    if varblk < self.tile_size:
+                        mask(tSrS, tScS, varblk)
+            else:
+                if varblk < self.tile_size:
+                    mask(tSrS, tScS, varblk)
 
             skip_softmax = cutlass.Boolean(False)
             if cutlass.const_expr(enable_skip_softmax):
@@ -492,9 +588,19 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     rescale_o_for_next_acc(tOrO, row_scale)
                     tOrP_frg.store(tSrS.load().to(self.K_dtype))
             else:
-                row_scale = online_softmax(tSrS, max_m, sum_m, scale_softmax_log2e)
-                rescale_o_for_next_acc(tOrO, row_scale)
-                tOrP_frg.store(tSrS.load().to(self.K_dtype))
+                if cutlass.const_expr(self.use_q128_shift):
+                    if warp_active:
+                        row_scale = online_softmax(
+                            tSrS, max_m, sum_m, scale_softmax_log2e
+                        )
+                        rescale_o_for_next_acc(tOrO, row_scale)
+                        tOrP_frg.store(tSrS.load().to(self.K_dtype))
+                else:
+                    row_scale = online_softmax(
+                        tSrS, max_m, sum_m, scale_softmax_log2e
+                    )
+                    rescale_o_for_next_acc(tOrO, row_scale)
+                    tOrP_frg.store(tSrS.load().to(self.K_dtype))
 
             if cutlass.const_expr(enable_skip_softmax):
                 if not skip_softmax:
@@ -515,18 +621,29 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
                 V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
                 v_stage = V_consumer_state.index
-                gemm_rs_smem(
-                    tiled_mma_pv,
-                    tOrO,
-                    tOrP,
-                    tOrV,
-                    tOsV_copy[None, None, None, v_stage],
-                    smem_tiled_copy_V,
-                )
+                if cutlass.const_expr(self.use_q128_shift):
+                    if warp_active:
+                        gemm_rs_smem(
+                            tiled_mma_pv,
+                            tOrO,
+                            tOrP,
+                            tOrV,
+                            tOsV_copy[None, None, None, v_stage],
+                            smem_tiled_copy_V,
+                        )
+                else:
+                    gemm_rs_smem(
+                        tiled_mma_pv,
+                        tOrO,
+                        tOrP,
+                        tOrV,
+                        tOsV_copy[None, None, None, v_stage],
+                        smem_tiled_copy_V,
+                    )
                 V_pipeline.consumer_release(V_consumer_state)
                 V_consumer_state.advance()
 
-                if warp_idx == 0 and preload_count < num_n_tiles:
+                if warp_idx == 0 and preload_count < num_union_tiles:
                     V_pipeline.producer_acquire(V_producer_state)
                     cute.copy(
                         tma_atom_V,
@@ -537,8 +654,16 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     V_pipeline.producer_commit(V_producer_state)
                     V_producer_state.advance()
 
-        final_ratio = finalize_softmax(sum_m)
-        rescale_o_for_next_acc(tOrO, final_ratio)
+        if cutlass.const_expr(self.use_q128_shift):
+            warp_has_rows = q_block_1_valid
+            if warp_idx < 4:
+                warp_has_rows = cutlass.Boolean(True)
+            if warp_has_rows:
+                final_ratio = finalize_softmax(sum_m)
+                rescale_o_for_next_acc(tOrO, final_ratio)
+        else:
+            final_ratio = finalize_softmax(sum_m)
+            rescale_o_for_next_acc(tOrO, final_ratio)
         if cutlass.const_expr(self.return_lse):
             lse = compute_lse(max_m, sum_m, scale_softmax_log2e)
             tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
@@ -695,7 +820,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
         self.shared_storage_t = SharedStorage
 
-        atom_layout_mnk = (4, 1, 1)
+        atom_layout_mnk = (8 if self.use_q128_shift else 4, 1, 1)
         mma_inst_mnk = (16, 8, 16)
         permutation_mnk = (
             atom_layout_mnk[0] * mma_inst_mnk[0],
@@ -793,6 +918,44 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 # =============================================================================
 # Local CuTe helpers
 # =============================================================================
+
+
+@cute.jit
+def q128_shift_union_item(
+    g_indices0: cute.Tensor,
+    g_indices1: cute.Tensor,
+    num_tiles: cutlass.Int32,
+    load_count: cutlass.Int32,
+    shifted_pair: cutlass.Boolean,
+    q_block_1_valid: cutlass.Boolean,
+):
+    """Map a reverse-order union position to a K/V block and row predicates.
+
+    The shifted layout is ``prefix + [x..x+63]`` for row 0 and
+    ``prefix + [x+1..x+64]`` for row 1. Reverse traversal is therefore the
+    row-1-only new tail, 63 shared blocks, the row-0-only old head, then the
+    shared prefix. Identical pairs use the ordinary reverse traversal.
+    """
+    logical_idx = num_tiles - 1 - load_count
+    physical_idx = g_indices0[logical_idx]
+    active_q0 = cutlass.Boolean(True)
+    active_q1 = q_block_1_valid
+
+    if shifted_pair:
+        if load_count == 0:
+            physical_idx = g_indices1[num_tiles - 1]
+            active_q0 = cutlass.Boolean(False)
+        else:
+            logical_idx = num_tiles - load_count
+            physical_idx = g_indices0[logical_idx]
+            active_q1 = cutlass.Boolean(False)
+            if physical_idx == g_indices1[logical_idx]:
+                active_q1 = q_block_1_valid
+            if logical_idx > 0:
+                if physical_idx == g_indices1[logical_idx - 1]:
+                    active_q1 = q_block_1_valid
+
+    return physical_idx, active_q0, active_q1
 
 
 @cute.jit

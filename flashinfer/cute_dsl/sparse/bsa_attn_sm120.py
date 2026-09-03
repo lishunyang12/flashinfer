@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -273,6 +274,15 @@ def bsa_attn_sm120_blk64_fwd(
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
 
+    use_q128_shift = (
+        os.environ.get("FLASHINFER_SM120_VSA_Q128_SHIFT") == "1"
+        and q.dtype == torch.bfloat16
+        and num_q_blocks >= 128
+        and has_block_nums
+        and not return_lse
+        and skip_threshold_log2 is None
+    )
+
     fwd_kernel = BlockSparseAttnForwardSm120Blk64(
         gqa_ratio=gqa_ratio,
         head_dim=head_dim,
@@ -285,6 +295,7 @@ def bsa_attn_sm120_blk64_fwd(
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
         return_lse=return_lse,
+        use_q128_shift=use_q128_shift,
     )
 
     compile_key = (
@@ -298,6 +309,7 @@ def bsa_attn_sm120_blk64_fwd(
         bool(has_block_sizes),
         int(block_sizes_mode),
         bool(return_lse),
+        bool(use_q128_shift),
         q_t.stride(),
         k_t.stride(),
         v_t.stride(),
