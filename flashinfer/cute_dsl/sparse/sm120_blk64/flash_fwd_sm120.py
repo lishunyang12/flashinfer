@@ -43,6 +43,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         has_block_sizes: bool = True,
         has_block_nums: bool = True,
         block_sizes_mode: int = 0,
+        kv_tile_size: int = 64,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -51,12 +52,21 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         )
         assert self.acc_dtype in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]
 
-        self.tile_size = 64
+        self.logical_block_size = 64
+        self.q_tile_size = 64
+        self.kv_tile_size = kv_tile_size
 
         assert blocksparse_blocksize_q == 64, (
             "Only block_size_m=64 is supported in this kernel."
         )
         assert blocksparse_blocksize_k in [64], "block_size_n should be one of [64]"
+        assert self.logical_block_size % self.kv_tile_size == 0, (
+            "kv_tile_size must divide the 64-token logical sparse block"
+        )
+        assert self.kv_tile_size in (16, 32, 64), (
+            "kv_tile_size must be one of 16, 32, or 64"
+        )
+        self.kv_tiles_per_logical_block = self.logical_block_size // self.kv_tile_size
         self.num_threads = 128
         self.kv_stage = 1
         self.q_stage = 1
@@ -71,8 +81,8 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.gqa_ratio = gqa_ratio
         self.qk_dim = head_dim
         self.value_dim = value_dim
-        self.tile_shape_qk = (self.tile_size, self.tile_size, self.qk_dim)
-        self.tile_shape_pv = (self.tile_size, self.value_dim, self.tile_size)
+        self.tile_shape_qk = (self.q_tile_size, self.kv_tile_size, self.qk_dim)
+        self.tile_shape_pv = (self.q_tile_size, self.value_dim, self.kv_tile_size)
 
         self.has_block_sizes = has_block_sizes
         self.has_block_nums = has_block_nums
@@ -116,7 +126,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         work_desc = self.get_work_desc()
         seqlen = mK.shape[0]
-        num_compute_tiles = cute.ceil_div(seqlen, self.tile_size)
+        num_compute_tiles = cute.ceil_div(seqlen, self.kv_tile_size)
 
         shared_storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage_t)
 
@@ -224,11 +234,12 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             None, work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx
         ]
         if cutlass.const_expr(self.has_block_nums):
-            num_n_tiles = blocksparse_num_blocks_q2k[
+            num_logical_n_tiles = blocksparse_num_blocks_q2k[
                 work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx
             ]
         else:
-            num_n_tiles = block_sparse_num
+            num_logical_n_tiles = block_sparse_num
+        num_n_tiles = num_logical_n_tiles * self.kv_tiles_per_logical_block
         if cutlass.const_expr(self.has_block_sizes):
             if cutlass.const_expr(self.block_sizes_mode == 1):
                 gBSZ = blocksparse_varblk
@@ -335,8 +346,13 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
             preload_count = cutlass.Int32(0)
             if preload_count < num_n_tiles:
-                logical_idx = num_n_tiles - 1 - preload_count
-                physical_idx = gIndices[logical_idx]
+                compute_idx = num_n_tiles - 1 - preload_count
+                logical_idx = compute_idx // self.kv_tiles_per_logical_block
+                logical_subtile = compute_idx % self.kv_tiles_per_logical_block
+                physical_idx = (
+                    gIndices[logical_idx] * self.kv_tiles_per_logical_block
+                    + logical_subtile
+                )
                 K_pipeline.producer_acquire(K_producer_state)
                 cute.copy(
                     tma_atom_K,
@@ -359,8 +375,13 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             if cutlass.const_expr(self.kv_stage > 1):
                 preload_count = cutlass.Int32(1)
                 if preload_count < num_n_tiles:
-                    logical_idx = num_n_tiles - 1 - preload_count
-                    physical_idx = gIndices[logical_idx]
+                    compute_idx = num_n_tiles - 1 - preload_count
+                    logical_idx = compute_idx // self.kv_tiles_per_logical_block
+                    logical_subtile = compute_idx % self.kv_tiles_per_logical_block
+                    physical_idx = (
+                        gIndices[logical_idx] * self.kv_tiles_per_logical_block
+                        + logical_subtile
+                    )
                     K_pipeline.producer_acquire(K_producer_state)
                     cute.copy(
                         tma_atom_K,
@@ -398,14 +419,22 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         Q_consumer_state.advance()
 
         for load_count in cutlass.range(0, num_n_tiles, 1, unroll=1):
-            n_tile_ind = num_n_tiles - 1 - load_count
-            n_tile_idx = gIndices[n_tile_ind]
+            compute_idx = num_n_tiles - 1 - load_count
+            logical_idx = compute_idx // self.kv_tiles_per_logical_block
+            logical_subtile = compute_idx % self.kv_tiles_per_logical_block
+            logical_n_tile_idx = gIndices[logical_idx]
+            n_tile_idx = (
+                logical_n_tile_idx * self.kv_tiles_per_logical_block + logical_subtile
+            )
             if cutlass.const_expr(self.has_block_sizes):
-                varblk = gBSZ[n_tile_idx]
+                logical_varblk = gBSZ[logical_n_tile_idx]
+                varblk = logical_varblk - logical_subtile * self.kv_tile_size
+                varblk = cutlass.max(varblk, cutlass.Int32(0))
+                varblk = cutlass.min(varblk, cutlass.Int32(self.kv_tile_size))
             else:
-                varblk = cutlass.Int32(self.tile_size)
+                varblk = cutlass.Int32(self.kv_tile_size)
                 if n_tile_idx == num_compute_tiles - 1:
-                    varblk = seqlen - n_tile_idx * self.tile_size
+                    varblk = seqlen - n_tile_idx * self.kv_tile_size
 
             K_wait_status = K_pipeline.consumer_try_wait(K_consumer_state)
             K_pipeline.consumer_wait(K_consumer_state, K_wait_status)
@@ -427,8 +456,13 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             preload_count = load_count + self.kv_stage
             preload_physical = cutlass.Int32(0)
             if warp_idx == 0 and preload_count < num_n_tiles:
-                preload_logical = num_n_tiles - 1 - preload_count
-                preload_physical = gIndices[preload_logical]
+                preload_compute = num_n_tiles - 1 - preload_count
+                preload_logical = preload_compute // self.kv_tiles_per_logical_block
+                preload_subtile = preload_compute % self.kv_tiles_per_logical_block
+                preload_physical = (
+                    gIndices[preload_logical] * self.kv_tiles_per_logical_block
+                    + preload_subtile
+                )
                 K_pipeline.producer_acquire(K_producer_state)
                 cute.copy(
                     tma_atom_K,
@@ -439,7 +473,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 K_pipeline.producer_commit(K_producer_state)
                 K_producer_state.advance()
 
-            if varblk < self.tile_size:
+            if varblk < self.kv_tile_size:
                 mask(tSrS, tScS, varblk)
 
             skip_softmax = cutlass.Boolean(False)
@@ -539,7 +573,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         rescale_o_for_next_acc(tOrO, final_ratio)
         tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
         for m in cutlass.range_constexpr(cute.size(lse)):
-            row_idx = work_desc.qo_tile_idx * self.tile_size + tScS_mn[m, 0][0]
+            row_idx = work_desc.qo_tile_idx * self.q_tile_size + tScS_mn[m, 0][0]
             if tScS_mn[m, 0][1] == 0:
                 if row_idx < mQ.shape[0]:
                     mLSE_slice[row_idx] = lse[m]

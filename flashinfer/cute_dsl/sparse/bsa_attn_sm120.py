@@ -114,6 +114,7 @@ def bsa_attn_sm120_blk64_fwd(
     q2k_block_nums: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    kv_tile_size: int = 64,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -135,6 +136,9 @@ def bsa_attn_sm120_blk64_fwd(
         skip_softmax_threshold_scale_factor: Skip a K/V tile when its contribution
             is below ``scale_factor / seqlen_k`` for every row in the CTA's
             query tile. None or zero selects the dense specialization.
+        kv_tile_size: Internal K/V compute tile. The logical sparse block remains
+            64 tokens. Values 16 and 32 are experimental tuning choices for SM120;
+            the default 64 preserves the production kernel schedule.
         return_lse: Whether to return log-sum-exp.
         out: Pre-allocated output tensor (batch, seqlen_q, num_heads, head_dim).
         lse: Pre-allocated LSE tensor (batch, num_heads, seqlen_q).
@@ -164,6 +168,10 @@ def bsa_attn_sm120_blk64_fwd(
     assert head_dim_v == 128, f"sm120_blk64 requires head_dim_v=128, got {head_dim_v}"
     assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+    if kv_tile_size not in (16, 32, 64):
+        raise ValueError(
+            f"kv_tile_size must be one of 16, 32, or 64, got {kv_tile_size}"
+        )
 
     gqa_ratio = num_heads // num_kv_heads
     num_q_blocks = _ceil_div(seqlen_q, _BLOCK_SIZE)
@@ -284,6 +292,7 @@ def bsa_attn_sm120_blk64_fwd(
         has_block_sizes=has_block_sizes,
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
+        kv_tile_size=kv_tile_size,
     )
 
     compile_key = (
@@ -296,6 +305,7 @@ def bsa_attn_sm120_blk64_fwd(
         bool(has_block_nums),
         bool(has_block_sizes),
         int(block_sizes_mode),
+        int(kv_tile_size),
         q_t.stride(),
         k_t.stride(),
         v_t.stride(),

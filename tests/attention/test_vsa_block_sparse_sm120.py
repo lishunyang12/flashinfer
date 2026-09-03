@@ -188,6 +188,37 @@ def test_vsa_sm120_accuracy(dtype, density, num_blocks, num_heads, workspace):
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("kv_tile_size", [16, 32])
+def test_vsa_sm120_internal_kv_tiles(kv_tile_size, workspace):
+    """Smaller compute tiles must preserve the 64-token sparse-mask contract."""
+    device = torch.device("cuda")
+    torch.manual_seed(43)
+    num_blocks, num_heads = 4, 4
+    M = N = num_blocks * R
+    q = torch.randn(M, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+
+    wrapper = _make_wrapper(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
+        q_data_type=torch.bfloat16,
+    )
+    reference = wrapper.run(q, k, v, sm120_kv_tile_size=64)
+    actual = wrapper.run(q, k, v, sm120_kv_tile_size=kv_tile_size)
+
+    torch.testing.assert_close(reference, actual, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("sm_scale", [0.5])
 def test_vsa_sm120_sm_scale(sm_scale, workspace):
     """User-supplied sm_scale must propagate correctly."""

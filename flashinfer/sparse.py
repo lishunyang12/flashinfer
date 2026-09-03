@@ -251,6 +251,7 @@ def _vsa_run_core(
     lse: Optional[torch.Tensor],
     return_lse: bool,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    kv_tile_size: Optional[int] = None,
 ):
     """Shared NHD→BSHD dispatch, kernel call, and BSHD→NHD reshape for all VSA backends."""
     if sm_scale is None:
@@ -261,6 +262,8 @@ def _vsa_run_core(
         fwd_kwargs["skip_softmax_threshold_scale_factor"] = (
             skip_softmax_threshold_scale_factor
         )
+    if kv_tile_size is not None:
+        fwd_kwargs["kv_tile_size"] = kv_tile_size
 
     o_bsa, lse_bsa = fwd_fn(
         q.unsqueeze(0).contiguous(),
@@ -1067,6 +1070,7 @@ class BlockSparseAttentionWrapper:
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        sm120_kv_tile_size: int = 64,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute block-sparse attention between Q/K/V tensors.
 
@@ -1100,6 +1104,10 @@ class BlockSparseAttentionWrapper:
             SM120 native BF16/FP16 skip-softmax threshold scale factor. The
             effective threshold is ``scale_factor / N``. None or zero disables
             skip-softmax. Only supported by ``vsa_sm120_blk64``.
+        sm120_kv_tile_size : int
+            Internal SM120 K/V compute tile (16, 32, or 64). The sparse mask
+            remains in 64-token logical blocks. Experimental; only supported by
+            ``vsa_sm120_blk64``.
 
         Returns
         -------
@@ -1120,6 +1128,10 @@ class BlockSparseAttentionWrapper:
             raise ValueError(
                 "skip_softmax_threshold_scale_factor is only supported by "
                 "the vsa_sm120_blk64 backend"
+            )
+        if sm120_kv_tile_size != 64 and self._backend != "vsa_sm120_blk64":
+            raise ValueError(
+                "sm120_kv_tile_size is only supported by the vsa_sm120_blk64 backend"
             )
 
         if self._backend == "cake":
@@ -1196,6 +1208,7 @@ class BlockSparseAttentionWrapper:
                 lse,
                 return_lse,
                 skip_softmax_threshold_scale_factor,
+                sm120_kv_tile_size,
             )
 
         pos_encoding_mode = self._pos_encoding_mode
