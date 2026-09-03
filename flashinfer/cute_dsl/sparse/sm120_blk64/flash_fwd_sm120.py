@@ -43,6 +43,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         has_block_sizes: bool = True,
         has_block_nums: bool = True,
         block_sizes_mode: int = 0,
+        return_lse: bool = False,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -77,6 +78,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.has_block_sizes = has_block_sizes
         self.has_block_nums = has_block_nums
         self.block_sizes_mode = block_sizes_mode
+        self.return_lse = return_lse
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
         if isinstance(tensor, list):
@@ -535,14 +537,16 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     V_pipeline.producer_commit(V_producer_state)
                     V_producer_state.advance()
 
-        final_ratio, lse = finalize_softmax(max_m, sum_m, scale_softmax_log2e)
+        final_ratio = finalize_softmax(sum_m)
         rescale_o_for_next_acc(tOrO, final_ratio)
-        tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
-        for m in cutlass.range_constexpr(cute.size(lse)):
-            row_idx = work_desc.qo_tile_idx * self.tile_size + tScS_mn[m, 0][0]
-            if tScS_mn[m, 0][1] == 0:
-                if row_idx < mQ.shape[0]:
-                    mLSE_slice[row_idx] = lse[m]
+        if cutlass.const_expr(self.return_lse):
+            lse = compute_lse(max_m, sum_m, scale_softmax_log2e)
+            tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
+            for m in cutlass.range_constexpr(cute.size(lse)):
+                row_idx = work_desc.qo_tile_idx * self.tile_size + tScS_mn[m, 0][0]
+                if tScS_mn[m, 0][1] == 0:
+                    if row_idx < mQ.shape[0]:
+                        mLSE_slice[row_idx] = lse[m]
 
         tOrO_cvt = cute.make_rmem_tensor_like(tOrO, self.O_dtype)
         tOrO_cvt.store(tOrO.load().to(self.O_dtype))
@@ -934,19 +938,30 @@ def online_softmax(
 
 @cute.jit
 def finalize_softmax(
-    row_max: cute.Tensor,
     row_sum: cute.Tensor,
-    softmax_scale_log2e: cutlass.Float32,
 ) -> cute.Tensor:
     row_sum.store(kernel_utils.warp_reduce(row_sum.load(), operator.add, width=4))
     final_ratio = cute.make_rmem_tensor_like(row_sum, cutlass.Float32)
-    lse = cute.make_rmem_tensor_like(row_sum, cutlass.Float32)
 
     for m in cutlass.range(cute.size(row_sum), unroll_full=True):
         final_sum = row_sum[m]
         is_zero_or_nan = final_sum == 0.0 or final_sum != final_sum
         final_ratio[m] = cute.arch.rcp_approx(final_sum if not is_zero_or_nan else 1.0)
 
+    return final_ratio
+
+
+@cute.jit
+def compute_lse(
+    row_max: cute.Tensor,
+    row_sum: cute.Tensor,
+    softmax_scale_log2e: cutlass.Float32,
+) -> cute.Tensor:
+    lse = cute.make_rmem_tensor_like(row_sum, cutlass.Float32)
+
+    for m in cutlass.range(cute.size(row_sum), unroll_full=True):
+        final_sum = row_sum[m]
+        is_zero_or_nan = final_sum == 0.0 or final_sum != final_sum
         ln2 = 0.693147180559945309417
         lse[m] = (
             -cutlass.Float32.inf
@@ -958,7 +973,7 @@ def finalize_softmax(
             * ln2
         )
 
-    return final_ratio, lse
+    return lse
 
 
 @cute.jit
