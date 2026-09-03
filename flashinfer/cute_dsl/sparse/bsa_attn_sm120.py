@@ -28,6 +28,7 @@ from .bsa_utils.testing import is_fake_mode
 from .bsa_utils.cute_tensor_utils import to_cute_tensor
 
 _BLOCK_SIZE = 64
+_SPLIT_N_MIN_Q_BLOCKS = 64
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -284,7 +285,14 @@ def bsa_attn_sm120_blk64_fwd(
         has_block_sizes=has_block_sizes,
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
+        use_split_n=(
+            q.dtype == torch.bfloat16
+            and skip_threshold_log2 is None
+            and num_q_blocks >= _SPLIT_N_MIN_Q_BLOCKS
+        ),
     )
+
+    use_split_n = fwd_kernel.use_split_n
 
     compile_key = (
         "sm120_blk64_fwd",
@@ -296,6 +304,7 @@ def bsa_attn_sm120_blk64_fwd(
         bool(has_block_nums),
         bool(has_block_sizes),
         int(block_sizes_mode),
+        bool(use_split_n),
         q_t.stride(),
         k_t.stride(),
         v_t.stride(),

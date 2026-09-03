@@ -43,6 +43,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         has_block_sizes: bool = True,
         has_block_nums: bool = True,
         block_sizes_mode: int = 0,
+        use_split_n: bool = False,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -81,6 +82,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.has_block_sizes = has_block_sizes
         self.has_block_nums = has_block_nums
         self.block_sizes_mode = block_sizes_mode
+        self.use_split_n = use_split_n
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
         if isinstance(tensor, list):
@@ -793,7 +795,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         # 256-thread CTAs can jointly expose 16 resident warps per SM.  Keep
         # the skip-softmax specialization on the original four-warp layout;
         # its CTA-wide voting protocol is intentionally independent.
-        self.split_n = skip_softmax_threshold_log2 is None
+        self.split_n = self.use_split_n
         self.num_threads = 256 if self.split_n else 128
 
         # Restore compile-time head dimensions while keeping runtime tensor modes dynamic.
