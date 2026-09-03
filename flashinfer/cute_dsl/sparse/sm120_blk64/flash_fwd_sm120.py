@@ -110,6 +110,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
         skip_softmax_threshold_log2: cutlass.Float32 | None,
+        cta_stagger_ns: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
@@ -125,6 +126,14 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_K)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_V)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_O)
+
+        # Two of these register-heavy CTAs reside on each SM.  Their identical
+        # QK -> softmax -> PV cadence otherwise tends to line up the scalar
+        # softmax gaps.  Offset adjacent head CTAs once at startup so the other
+        # resident CTA can issue BF16 MMA work during those gaps.  Zero keeps
+        # the original schedule and makes this an opt-in tuning knob.
+        if cta_stagger_ns > 0 and work_desc.qo_head_idx % 2 == 1:
+            cute.arch.nanosleep(sleep_time=cta_stagger_ns)
 
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
@@ -596,6 +605,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         blocksparse_varblk: cute.Tensor,
         softmax_scale: cutlass.Float32,
         skip_softmax_threshold_log2: cutlass.Float32 | None,
+        cta_stagger_ns: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         # Restore compile-time head dimensions while keeping runtime tensor modes dynamic.
@@ -776,6 +786,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             self.O_smem_layout,
             softmax_scale * log2_e,
             skip_softmax_threshold_log2,
+            cta_stagger_ns,
         ).launch(
             grid=grid_config,
             block=block_config,
