@@ -44,6 +44,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         has_block_nums: bool = True,
         block_sizes_mode: int = 0,
         return_lse: bool = False,
+        work_groups: int = 1,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -58,12 +59,23 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             "Only block_size_m=64 is supported in this kernel."
         )
         assert blocksparse_blocksize_k in [64], "block_size_n should be one of [64]"
-        self.num_threads = 128
+        assert work_groups in (1, 2)
+        self.work_groups = work_groups
+        self.threads_per_work = 128
+        self.num_threads = self.threads_per_work * self.work_groups
         self.kv_stage = 1
         self.q_stage = 1
         self.skip_softmax_cta_barrier = pipeline.NamedBarrier(
             barrier_id=1,
-            num_threads=self.num_threads,
+            num_threads=self.threads_per_work,
+        )
+        self.work_group_0_barrier = pipeline.NamedBarrier(
+            barrier_id=2,
+            num_threads=self.threads_per_work,
+        )
+        self.work_group_1_barrier = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=self.threads_per_work,
         )
 
         assert gqa_ratio >= 1
@@ -116,7 +128,12 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        work_desc = self.get_work_desc()
+        warps_per_work = self.threads_per_work // cute.arch.WARP_SIZE
+        work_group = warp_idx // warps_per_work
+        local_tidx = tidx - work_group * self.threads_per_work
+        local_warp_idx = warp_idx - work_group * warps_per_work
+        num_q_tiles = cute.ceil_div(mQ.shape[0], self.tile_size)
+        work_desc = self.get_work_desc(work_group, num_q_tiles)
         seqlen = mK.shape[0]
         num_compute_tiles = cute.ceil_div(seqlen, self.tile_size)
 
@@ -135,12 +152,13 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             num_stages=1,
             producer_group=cg,
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_threads // 32
+                pipeline.Agent.Thread, self.threads_per_work // 32
             ),
             tx_count=cute.size_in_bytes(
                 self.Q_dtype, cute.select(Q_smem_layout, mode=[0, 1])
             ),
-            barrier_storage=shared_storage.Q_barrier.data_ptr(),
+            barrier_storage=shared_storage.Q_barrier.data_ptr()
+            + work_group * self.q_stage * 2,
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
         Q_producer_state = pipeline.make_pipeline_state(
@@ -153,24 +171,26 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             num_stages=self.kv_stage,
             producer_group=cg,
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_threads // 32
+                pipeline.Agent.Thread, self.threads_per_work // 32
             ),
             tx_count=cute.size_in_bytes(
                 self.K_dtype, cute.select(K_smem_layout, mode=[0, 1])
             ),
-            barrier_storage=shared_storage.K_barrier.data_ptr(),
+            barrier_storage=shared_storage.K_barrier.data_ptr()
+            + work_group * self.kv_stage * 2,
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
         V_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.kv_stage,
             producer_group=cg,
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_threads // 32
+                pipeline.Agent.Thread, self.threads_per_work // 32
             ),
             tx_count=cute.size_in_bytes(
                 self.V_dtype, cute.select(V_smem_layout, mode=[0, 1])
             ),
-            barrier_storage=shared_storage.V_barrier.data_ptr(),
+            barrier_storage=shared_storage.V_barrier.data_ptr()
+            + work_group * self.kv_stage * 2,
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
         K_producer_state = pipeline.make_pipeline_state(
@@ -187,17 +207,35 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         )
 
         # partition tensors
-        sQ = shared_storage.Q_smem.get_tensor(
-            Q_smem_layout.outer, swizzle=Q_smem_layout.inner
+        sQ = cute.make_tensor(
+            cute.recast_ptr(
+                shared_storage.Q_smem.data_ptr()
+                + work_group * cute.cosize(Q_smem_layout),
+                Q_smem_layout.inner,
+                dtype=self.Q_dtype,
+            ),
+            Q_smem_layout.outer,
         )
-        sK = shared_storage.K_smem.get_tensor(
-            K_smem_layout.outer, swizzle=K_smem_layout.inner
+        sK = cute.make_tensor(
+            cute.recast_ptr(
+                shared_storage.K_smem.data_ptr()
+                + work_group * cute.cosize(K_smem_layout),
+                K_smem_layout.inner,
+                dtype=self.K_dtype,
+            ),
+            K_smem_layout.outer,
         )
-        sV = shared_storage.V_smem.get_tensor(
-            V_smem_layout.outer, swizzle=V_smem_layout.inner
+        sV = cute.make_tensor(
+            cute.recast_ptr(
+                shared_storage.V_smem.data_ptr()
+                + work_group * cute.cosize(V_smem_layout),
+                V_smem_layout.inner,
+                dtype=self.V_dtype,
+            ),
+            V_smem_layout.outer,
         )
         skip_softmax_warp_votes = shared_storage.skip_softmax_warp_votes.get_tensor(
-            cute.make_layout((self.num_threads // cute.arch.WARP_SIZE,))
+            cute.make_layout((self.threads_per_work // cute.arch.WARP_SIZE,))
         )
 
         mO_slice = mO[None, None, work_desc.qo_head_idx, work_desc.batch_idx]
@@ -266,7 +304,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
         cS = cute.make_identity_tensor(self.tile_shape_qk[:2])
 
-        thr_mma_qk = tiled_mma_qk.get_slice(tidx)
+        thr_mma_qk = tiled_mma_qk.get_slice(local_tidx)
         tSsQ = thr_mma_qk.partition_A(sQ)
         tSsK = thr_mma_qk.partition_B(sK)
         tSrQ = tiled_mma_qk.make_fragment_A(tSsQ[None, None, None, 0])
@@ -279,7 +317,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         )
         tScS = thr_mma_qk.partition_C(cS)
 
-        thr_mma_pv = tiled_mma_pv.get_slice(tidx)
+        thr_mma_pv = tiled_mma_pv.get_slice(local_tidx)
         tOsV = thr_mma_pv.partition_B(sV)
         tOrV = tiled_mma_pv.make_fragment_B(tOsV[None, None, None, 0])
         tOrO = cute.make_rmem_tensor(
@@ -305,9 +343,9 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         smem_tiled_copy_K = cute.make_tiled_copy_B(atom_copy_ldmatrix_K, tiled_mma_qk)
         smem_tiled_copy_V = cute.make_tiled_copy_B(atom_copy_ldmatrix_V, tiled_mma_pv)
 
-        thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
-        thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
-        thr_copy_V = smem_tiled_copy_V.get_slice(tidx)
+        thr_copy_Q = smem_tiled_copy_Q.get_slice(local_tidx)
+        thr_copy_K = smem_tiled_copy_K.get_slice(local_tidx)
+        thr_copy_V = smem_tiled_copy_V.get_slice(local_tidx)
         tSsQ_copy = thr_copy_Q.partition_S(sQ)
         tSrQ_copy = thr_copy_Q.retile(tSrQ)
         tSsK_copy = thr_copy_K.partition_S(sK)
@@ -324,7 +362,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         sum_m.store(cute.full_like(sum_m, 0.0, cutlass.Float32))
         enable_skip_softmax = skip_softmax_threshold_log2 is not None
 
-        if warp_idx == 0:
+        if local_warp_idx == 0:
             Q_pipeline.producer_acquire(Q_producer_state)
             cute.copy(
                 tma_atom_Q,
@@ -385,7 +423,13 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                         V_pipeline.producer_commit(V_producer_state)
                         V_producer_state.advance()
 
-        cute.arch.sync_threads()
+        if cutlass.const_expr(self.work_groups == 1):
+            cute.arch.sync_threads()
+        else:
+            if work_group == 0:
+                self.work_group_0_barrier.arrive_and_wait()
+            else:
+                self.work_group_1_barrier.arrive_and_wait()
 
         Q_wait_status = Q_pipeline.consumer_try_wait(Q_consumer_state)
         Q_pipeline.consumer_wait(Q_consumer_state, Q_wait_status)
@@ -428,7 +472,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
             preload_count = load_count + self.kv_stage
             preload_physical = cutlass.Int32(0)
-            if warp_idx == 0 and preload_count < num_n_tiles:
+            if local_warp_idx == 0 and preload_count < num_n_tiles:
                 preload_logical = num_n_tiles - 1 - preload_count
                 preload_physical = gIndices[preload_logical]
                 K_pipeline.producer_acquire(K_producer_state)
@@ -453,7 +497,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     skip_softmax_threshold_log2,
                 )
                 with cute.arch.elect_one():
-                    skip_softmax_warp_votes[warp_idx] = warp_wants_skip
+                    skip_softmax_warp_votes[local_warp_idx] = warp_wants_skip
                 self.skip_softmax_cta_barrier.arrive_and_wait()
                 skip_softmax_votes_i32 = cute.make_tensor(
                     cute.recast_ptr(
@@ -464,13 +508,13 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 )
                 skip_softmax = (
                     cute.arch.popc(skip_softmax_votes_i32[0])
-                    == self.num_threads // cute.arch.WARP_SIZE
+                    == self.threads_per_work // cute.arch.WARP_SIZE
                 )
                 # V is shared by the CTA, so omit its transfer only after all
                 # four warps agree. Start a required transfer before softmax
                 # to overlap its latency with the scalar work below.
                 if not skip_softmax:
-                    if warp_idx == 0:
+                    if local_warp_idx == 0:
                         V_pipeline.producer_acquire(V_producer_state)
                         cute.copy(
                             tma_atom_V,
@@ -526,7 +570,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 V_pipeline.consumer_release(V_consumer_state)
                 V_consumer_state.advance()
 
-                if warp_idx == 0 and preload_count < num_n_tiles:
+                if local_warp_idx == 0 and preload_count < num_n_tiles:
                     V_pipeline.producer_acquire(V_producer_state)
                     cute.copy(
                         tma_atom_V,
@@ -557,8 +601,14 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         # single stage); each warp writes exactly the M partition it previously read.
         # sync_threads() below ensures R2S is complete before TMA store reads sO.
         # Re-verify if O tile shape, O dtype, or PV warp layout ever changes.
-        sO = shared_storage.Q_smem.get_tensor(
-            O_smem_layout.outer, swizzle=O_smem_layout.inner
+        sO = cute.make_tensor(
+            cute.recast_ptr(
+                shared_storage.Q_smem.data_ptr()
+                + work_group * cute.cosize(O_smem_layout),
+                O_smem_layout.inner,
+                dtype=self.O_dtype,
+            ),
+            O_smem_layout.outer,
         )
         tiled_copy_o_r2s = cute.make_tiled_copy_C(
             cute.make_copy_atom(
@@ -568,11 +618,17 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             tiled_mma_pv,
         )
         tOrO_cv = tiled_copy_o_r2s.retile(tOrO_cvt)
-        tOsO = tiled_copy_o_r2s.get_slice(tidx).partition_D(sO)
+        tOsO = tiled_copy_o_r2s.get_slice(local_tidx).partition_D(sO)
         cute.copy(tiled_copy_o_r2s, tOrO_cv, tOsO)
 
         cute.arch.fence_view_async_shared()
-        cute.arch.sync_threads()
+        if cutlass.const_expr(self.work_groups == 1):
+            cute.arch.sync_threads()
+        else:
+            if work_group == 0:
+                self.work_group_0_barrier.arrive_and_wait()
+            else:
+                self.work_group_1_barrier.arrive_and_wait()
 
         # S2G with explicit TMA store wait.
         tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
@@ -581,7 +637,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             cute.group_modes(sO, 0, 2),
             cute.group_modes(gO, 0, 2),
         )
-        if warp_idx == 0:
+        if local_warp_idx == 0:
             cute.copy(tma_atom_O, tOsO, tOgO)
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -676,21 +732,39 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
         @cute.struct
         class SharedStorage:
-            Q_barrier: cute.struct.MemRange[cutlass.Int64, self.q_stage * 2]
-            K_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
-            V_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
+            Q_barrier: cute.struct.MemRange[
+                cutlass.Int64, self.q_stage * 2 * self.work_groups
+            ]
+            K_barrier: cute.struct.MemRange[
+                cutlass.Int64, self.kv_stage * 2 * self.work_groups
+            ]
+            V_barrier: cute.struct.MemRange[
+                cutlass.Int64, self.kv_stage * 2 * self.work_groups
+            ]
             skip_softmax_warp_votes: cute.struct.MemRange[
-                cutlass.Int8, self.num_threads // 32
+                cutlass.Int8, self.threads_per_work // 32
             ]
 
             Q_smem: cute.struct.Align[
-                cute.struct.MemRange[self.Q_dtype, cute.cosize(self.Q_smem_layout)], 128
+                cute.struct.MemRange[
+                    self.Q_dtype,
+                    cute.cosize(self.Q_smem_layout) * self.work_groups,
+                ],
+                128,
             ]
             K_smem: cute.struct.Align[
-                cute.struct.MemRange[self.K_dtype, cute.cosize(self.K_smem_layout)], 128
+                cute.struct.MemRange[
+                    self.K_dtype,
+                    cute.cosize(self.K_smem_layout) * self.work_groups,
+                ],
+                128,
             ]
             V_smem: cute.struct.Align[
-                cute.struct.MemRange[self.V_dtype, cute.cosize(self.V_smem_layout)], 128
+                cute.struct.MemRange[
+                    self.V_dtype,
+                    cute.cosize(self.V_smem_layout) * self.work_groups,
+                ],
+                128,
             ]
 
         self.shared_storage_t = SharedStorage

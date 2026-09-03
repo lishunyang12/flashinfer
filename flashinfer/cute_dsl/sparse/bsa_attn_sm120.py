@@ -273,6 +273,16 @@ def bsa_attn_sm120_blk64_fwd(
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
 
+    # Pack two independent 4-warp query tiles into one CTA for the long BF16
+    # output-only path. This preserves eight resident warps per SM while giving
+    # each scheduler an independent QK -> softmax -> PV dependency chain.
+    use_dual_query = (
+        q.dtype == torch.bfloat16
+        and num_q_blocks >= 128
+        and not return_lse
+        and skip_threshold_log2 is None
+    )
+
     fwd_kernel = BlockSparseAttnForwardSm120Blk64(
         gqa_ratio=gqa_ratio,
         head_dim=head_dim,
@@ -285,6 +295,7 @@ def bsa_attn_sm120_blk64_fwd(
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
         return_lse=return_lse,
+        work_groups=2 if use_dual_query else 1,
     )
 
     compile_key = (
@@ -298,6 +309,7 @@ def bsa_attn_sm120_blk64_fwd(
         bool(has_block_sizes),
         int(block_sizes_mode),
         bool(return_lse),
+        bool(use_dual_query),
         q_t.stride(),
         k_t.stride(),
         v_t.stride(),

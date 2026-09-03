@@ -33,9 +33,20 @@ class BatchedStaticSchedulerMixin:
         # tiles carry much more KV work than video tiles; scheduling every head
         # of those tiles together avoids injecting another long-running CTA
         # after an entire head's light video region has already launched.
-        return (num_qo_heads, num_q_tiles, batch_size)
+        return (
+            num_qo_heads,
+            cute.ceil_div(num_q_tiles, self.work_groups),
+            batch_size,
+        )
 
-    def get_work_desc(self):
+    def get_work_desc(self, work_group, num_q_tiles):
         qo_head_idx, qo_tile_idx, batch_idx = cute.arch.block_idx()
+        qo_tile_idx = qo_tile_idx * self.work_groups + work_group
+        # The long-BF16 dual-query specialization intentionally maps the one
+        # odd tail work-group onto the last valid tile. Both groups then store
+        # identical bits to that tile. This keeps the prototype single-launch;
+        # replace it with a dedicated tail launch before productionizing.
+        if qo_tile_idx >= num_q_tiles:
+            qo_tile_idx = num_q_tiles - 1
         kv_head_idx = qo_head_idx // self.gqa_ratio
         return BatchedStaticWorkDesc(qo_tile_idx, qo_head_idx, kv_head_idx, batch_idx)
