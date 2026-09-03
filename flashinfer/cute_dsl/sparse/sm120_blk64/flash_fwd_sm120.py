@@ -111,6 +111,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         Q_smem_layout: cute.ComposedLayout,
         K_smem_layout: cute.ComposedLayout,
         V_smem_layout: cute.ComposedLayout,
+        P_smem_layout: cute.ComposedLayout,
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
         skip_softmax_threshold_log2: cutlass.Float32 | None,
@@ -204,9 +205,9 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         sP = cute.make_tensor(
             cute.recast_ptr(
                 cute.recast_ptr(sQ.iterator, dtype=self.Q_dtype),
-                self.P_smem_layout.inner,
+                P_smem_layout.inner,
             ),
-            self.P_smem_layout.outer,
+            P_smem_layout.outer,
         )
         row_exchange = shared_storage.row_exchange.get_tensor(
             cute.make_layout((2, self.tile_size))
@@ -979,6 +980,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             self.Q_smem_layout,
             self.K_smem_layout,
             self.V_smem_layout,
+            self.P_smem_layout,
             self.O_smem_layout,
             softmax_scale * log2_e,
             skip_softmax_threshold_log2,
