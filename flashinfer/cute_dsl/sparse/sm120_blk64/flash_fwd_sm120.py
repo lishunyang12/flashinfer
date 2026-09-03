@@ -128,7 +128,8 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
-        # TMA load barriers. Q/K/V each use a single-stage buffer.
+        # Q and V alias one single-stage buffer: Q is held in registers before
+        # the KV loop starts, and V is dead before the output epilogue.
         Q_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=1,
             producer_group=cg,
@@ -191,8 +192,12 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         sK = shared_storage.K_smem.get_tensor(
             K_smem_layout.outer, swizzle=K_smem_layout.inner
         )
-        sV = shared_storage.V_smem.get_tensor(
-            V_smem_layout.outer, swizzle=V_smem_layout.inner
+        sV = cute.make_tensor(
+            cute.recast_ptr(
+                cute.recast_ptr(sQ.iterator, dtype=self.V_dtype),
+                V_smem_layout.inner,
+            ),
+            V_smem_layout.outer,
         )
         skip_softmax_warp_votes = shared_storage.skip_softmax_warp_votes.get_tensor(
             cute.make_layout((self.num_threads // cute.arch.WARP_SIZE,))
@@ -346,16 +351,6 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 )
                 K_pipeline.producer_commit(K_producer_state)
                 K_producer_state.advance()
-                if cutlass.const_expr(not enable_skip_softmax):
-                    V_pipeline.producer_acquire(V_producer_state)
-                    cute.copy(
-                        tma_atom_V,
-                        tVgV[None, physical_idx],
-                        tVsV[None, V_producer_state.index],
-                        tma_bar_ptr=V_pipeline.producer_get_barrier(V_producer_state),
-                    )
-                    V_pipeline.producer_commit(V_producer_state)
-                    V_producer_state.advance()
             if cutlass.const_expr(self.kv_stage > 1):
                 preload_count = cutlass.Int32(1)
                 if preload_count < num_n_tiles:
@@ -370,18 +365,6 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     )
                     K_pipeline.producer_commit(K_producer_state)
                     K_producer_state.advance()
-                    if cutlass.const_expr(not enable_skip_softmax):
-                        V_pipeline.producer_acquire(V_producer_state)
-                        cute.copy(
-                            tma_atom_V,
-                            tVgV[None, physical_idx],
-                            tVsV[None, V_producer_state.index],
-                            tma_bar_ptr=V_pipeline.producer_get_barrier(
-                                V_producer_state
-                            ),
-                        )
-                        V_pipeline.producer_commit(V_producer_state)
-                        V_producer_state.advance()
 
         cute.arch.sync_threads()
 
@@ -396,6 +379,22 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             )
         Q_pipeline.consumer_release(Q_consumer_state)
         Q_consumer_state.advance()
+
+        # Every warp must finish reading Q before V overwrites the aliased
+        # shared-memory buffer. The transfer then overlaps the first QK GEMM.
+        cute.arch.sync_threads()
+        if warp_idx == 0 and cutlass.const_expr(not enable_skip_softmax):
+            if num_n_tiles > 0:
+                physical_idx = gIndices[num_n_tiles - 1]
+                V_pipeline.producer_acquire(V_producer_state)
+                cute.copy(
+                    tma_atom_V,
+                    tVgV[None, physical_idx],
+                    tVsV[None, V_producer_state.index],
+                    tma_bar_ptr=V_pipeline.producer_get_barrier(V_producer_state),
+                )
+                V_pipeline.producer_commit(V_producer_state)
+                V_producer_state.advance()
 
         for load_count in cutlass.range(0, num_n_tiles, 1, unroll=1):
             n_tile_ind = num_n_tiles - 1 - load_count
@@ -547,12 +546,9 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         tOrO_cvt = cute.make_rmem_tensor_like(tOrO, self.O_dtype)
         tOrO_cvt.store(tOrO.load().to(self.O_dtype))
 
-        # R2S, reusing Q smem for the TMA-store epilogue.
-        # Safe because: Q is fully in registers before the KV loop; O_dtype == Q_dtype
-        # so O_smem_layout is identical to Q_smem_layout (same tile, dtype, majorness,
-        # single stage); each warp writes exactly the M partition it previously read.
-        # sync_threads() below ensures R2S is complete before TMA store reads sO.
-        # Re-verify if O tile shape, O dtype, or PV warp layout ever changes.
+        # R2S reuses the aliased Q/V buffer. All warps must finish reading the
+        # final V tile before any warp overwrites it with output fragments.
+        cute.arch.sync_threads()
         sO = shared_storage.Q_smem.get_tensor(
             O_smem_layout.outer, swizzle=O_smem_layout.inner
         )
@@ -685,9 +681,6 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             K_smem: cute.struct.Align[
                 cute.struct.MemRange[self.K_dtype, cute.cosize(self.K_smem_layout)], 128
             ]
-            V_smem: cute.struct.Align[
-                cute.struct.MemRange[self.V_dtype, cute.cosize(self.V_smem_layout)], 128
-            ]
 
         self.shared_storage_t = SharedStorage
 
@@ -782,7 +775,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             cluster=(1, 1, 1),
             smem=self.shared_storage_t.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=3,
         )
 
 
