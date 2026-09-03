@@ -244,8 +244,7 @@ def bsa_attn_sm120_blk64_fwd(
         and skip_threshold_log2 is None
         and gqa_ratio == 1
         and has_block_nums
-        and has_block_sizes
-        and block_sizes_mode == 1
+        and (not has_block_sizes or block_sizes_mode == 1)
         and seqlen_q >= 65536
         and seqlen_q % _BLOCK_SIZE == 0
         and seqlen_k % _BLOCK_SIZE == 0
