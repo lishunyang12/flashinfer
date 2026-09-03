@@ -779,7 +779,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             cluster=(1, 1, 1),
             smem=self.shared_storage_t.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=3,
         )
 
 
