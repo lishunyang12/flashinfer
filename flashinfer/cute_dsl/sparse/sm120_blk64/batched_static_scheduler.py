@@ -39,6 +39,7 @@ class BatchedStaticSchedulerMixin:
             batch_size,
         )
 
+    @cute.jit
     def get_work_desc(self, work_group, num_q_tiles):
         qo_head_idx, qo_tile_idx, batch_idx = cute.arch.block_idx()
         qo_tile_idx = qo_tile_idx * self.work_groups + work_group
