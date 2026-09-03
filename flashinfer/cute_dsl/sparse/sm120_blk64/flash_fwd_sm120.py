@@ -58,7 +58,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         )
         assert blocksparse_blocksize_k in [64], "block_size_n should be one of [64]"
         self.num_threads = 128
-        self.kv_stage = 1
+        self.kv_stage = 2
         self.q_stage = 1
         self.skip_softmax_cta_barrier = pipeline.NamedBarrier(
             barrier_id=1,
