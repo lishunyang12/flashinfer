@@ -147,6 +147,39 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
+        # PipelineTmaAsync initializes barriers from CTA warp 0. With two
+        # independent work groups its dynamic barrier pointer therefore only
+        # initializes group 0; initialize group 1 explicitly before either
+        # group can enter the pipeline.
+        if cutlass.const_expr(self.work_groups == 2):
+            if warp_idx == 0:
+                cute.arch.mbarrier_init(
+                    shared_storage.Q_barrier.data_ptr() + self.q_stage * 2,
+                    1,
+                )
+                cute.arch.mbarrier_init(
+                    shared_storage.Q_barrier.data_ptr() + self.q_stage * 3,
+                    self.threads_per_work // cute.arch.WARP_SIZE,
+                )
+                cute.arch.mbarrier_init(
+                    shared_storage.K_barrier.data_ptr() + self.kv_stage * 2,
+                    1,
+                )
+                cute.arch.mbarrier_init(
+                    shared_storage.K_barrier.data_ptr() + self.kv_stage * 3,
+                    self.threads_per_work // cute.arch.WARP_SIZE,
+                )
+                cute.arch.mbarrier_init(
+                    shared_storage.V_barrier.data_ptr() + self.kv_stage * 2,
+                    1,
+                )
+                cute.arch.mbarrier_init(
+                    shared_storage.V_barrier.data_ptr() + self.kv_stage * 3,
+                    self.threads_per_work // cute.arch.WARP_SIZE,
+                )
+            cute.arch.mbarrier_init_fence()
+            cute.arch.sync_threads()
+
         # TMA load barriers. Q/K/V each use a single-stage buffer.
         Q_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=1,
