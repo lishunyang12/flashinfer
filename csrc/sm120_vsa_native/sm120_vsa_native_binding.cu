@@ -46,6 +46,10 @@ struct MmaResult {
   float x0, x1, x2, x3;
 };
 
+__device__ __forceinline__ int swizzled_col(int row, int col) {
+  return col ^ ((row & 7) << 3);
+}
+
 __device__ __forceinline__ MmaResult mma_bf16_m16n8k16(
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1,
     float c0, float c1, float c2, float c3) {
@@ -108,9 +112,10 @@ __device__ __forceinline__ void load_tile(bf16 (&dst)[kTile][kHeadDim],
   for (int vec = lane; vec < kVecsPerTile; vec += 32) {
     const int row = vec / kVecsPerRow;
     const int col = (vec % kVecsPerRow) * kVecBf16;
+    const int dst_col = swizzled_col(row, col);
     const int64_t src_idx =
         qkv_offset(batch_idx, token_base + row, head_idx, seqlen, num_heads) + col;
-    *reinterpret_cast<uint4*>(&dst[row][col]) =
+    *reinterpret_cast<uint4*>(&dst[row][dst_col]) =
         *reinterpret_cast<const uint4*>(src + src_idx);
   }
 }
@@ -133,7 +138,7 @@ __device__ __forceinline__ uint32_t load_q_a(const bf16* q, int warp,
   const int thread_in_group = lane & 3;
   const int row = warp * 16 + group + ((fragment == 1 || fragment == 3) ? 8 : 0);
   const int col = k_step * 16 + thread_in_group * 2 + (fragment >= 2 ? 8 : 0);
-  return load_bf16x2(q + row * kHeadDim + col);
+  return load_bf16x2(q + row * kHeadDim + swizzled_col(row, col));
 }
 
 __device__ __forceinline__ uint32_t load_k_b(const bf16* k, int n_step,
@@ -143,7 +148,7 @@ __device__ __forceinline__ uint32_t load_k_b(const bf16* k, int n_step,
   const int thread_in_group = lane & 3;
   const int row = n_step * 8 + group;
   const int col = k_step * 16 + thread_in_group * 2 + (fragment ? 8 : 0);
-  return load_bf16x2(k + row * kHeadDim + col);
+  return load_bf16x2(k + row * kHeadDim + swizzled_col(row, col));
 }
 
 __device__ __forceinline__ uint32_t load_v_b(const bf16* v, int n_step,
@@ -153,8 +158,9 @@ __device__ __forceinline__ uint32_t load_v_b(const bf16* v, int n_step,
   const int thread_in_group = lane & 3;
   const int row0 = k_step * 16 + thread_in_group * 2 + (fragment ? 8 : 0);
   const int col = n_step * 8 + group;
-  return load_strided_bf16x2(v + row0 * kHeadDim + col,
-                             v + (row0 + 1) * kHeadDim + col);
+  return load_strided_bf16x2(
+      v + row0 * kHeadDim + swizzled_col(row0, col),
+      v + (row0 + 1) * kHeadDim + swizzled_col(row0 + 1, col));
 }
 
 __device__ __forceinline__ void zero_output(bf16* output, int batch_idx,
@@ -175,7 +181,7 @@ __device__ __forceinline__ void zero_output(bf16* output, int batch_idx,
   }
 }
 
-__global__ __launch_bounds__(kThreads, 2) void vsa_bf16_h3_kernel(
+__global__ __maxnreg__(200) void vsa_bf16_h3_kernel(
     const bf16* __restrict__ q, const bf16* __restrict__ k,
     const bf16* __restrict__ v, bf16* __restrict__ output,
     const int32_t* __restrict__ indices, const int32_t* __restrict__ block_nums,

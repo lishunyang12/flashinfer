@@ -21,7 +21,7 @@ from . import env as jit_env
 from .core import JitSpec, gen_jit_spec, sm120a_nvcc_flags
 
 
-_MODULE_NAME = "sm120_vsa_native_pipeline_v1"
+_MODULE_NAME = "sm120_vsa_native_pipeline_v2"
 
 
 def _repo_root() -> Path:
