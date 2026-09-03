@@ -271,7 +271,7 @@ def _vsa_run_core(
         block_sizes=None,
         q2k_block_nums=vsa_q2k_num,
         softmax_scale=sm_scale,
-        return_lse=True,
+        return_lse=return_lse,
         **fwd_kwargs,
     )
 
