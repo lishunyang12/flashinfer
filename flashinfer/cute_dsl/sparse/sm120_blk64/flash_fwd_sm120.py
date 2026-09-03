@@ -44,6 +44,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         has_block_nums: bool = True,
         block_sizes_mode: int = 0,
         return_lse: bool = False,
+        use_reg_pair: bool = False,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -79,6 +80,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.has_block_nums = has_block_nums
         self.block_sizes_mode = block_sizes_mode
         self.return_lse = return_lse
+        self.use_reg_pair = use_reg_pair
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
         if isinstance(tensor, list):
@@ -399,7 +401,188 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         Q_pipeline.consumer_release(Q_consumer_state)
         Q_consumer_state.advance()
 
-        for load_count in cutlass.range(0, num_n_tiles, 1, unroll=1):
+        if cutlass.const_expr(self.use_reg_pair):
+            # Keep the first tile's scores in the BF16 P fragment while QK for
+            # the second tile runs. The pair shares one max update and one O
+            # rescale without adding shared memory or live register tensors.
+            tOrP_frg_pair = cute.make_rmem_tensor_like(tSrS, self.K_dtype)
+            tOrP_pair = layout_utils.reshape_acc_to_frgA(tOrP_frg_pair)
+            for load_count in cutlass.range(0, num_n_tiles, 2, unroll=1):
+                first_ind = num_n_tiles - 1 - load_count
+                first_idx = gIndices[first_ind]
+                if cutlass.const_expr(self.has_block_sizes):
+                    first_varblk = gBSZ[first_idx]
+                else:
+                    first_varblk = cutlass.Int32(self.tile_size)
+                    if first_idx == num_compute_tiles - 1:
+                        first_varblk = seqlen - first_idx * self.tile_size
+
+                K_wait_status = K_pipeline.consumer_try_wait(K_consumer_state)
+                K_pipeline.consumer_wait(K_consumer_state, K_wait_status)
+                gemm_smem_zero_acc(
+                    tiled_mma_qk,
+                    tSrS,
+                    tSrQ,
+                    tSrK,
+                    tSsK_copy[None, None, None, K_consumer_state.index],
+                    smem_tiled_copy_K,
+                )
+                K_pipeline.consumer_release(K_consumer_state)
+                K_consumer_state.advance()
+
+                if first_varblk < self.tile_size:
+                    mask(tSrS, tScS, first_varblk)
+
+                has_second = load_count + 1 < num_n_tiles
+                if has_second:
+                    second_ind = first_ind - 1
+                    second_idx = gIndices[second_ind]
+                    if cutlass.const_expr(self.has_block_sizes):
+                        second_varblk = gBSZ[second_idx]
+                    else:
+                        second_varblk = cutlass.Int32(self.tile_size)
+                        if second_idx == num_compute_tiles - 1:
+                            second_varblk = seqlen - second_idx * self.tile_size
+
+                    if warp_idx == 0:
+                        K_pipeline.producer_acquire(K_producer_state)
+                        cute.copy(
+                            tma_atom_K,
+                            tKgK[None, second_idx],
+                            tKsK[None, K_producer_state.index],
+                            tma_bar_ptr=K_pipeline.producer_get_barrier(
+                                K_producer_state
+                            ),
+                        )
+                        K_pipeline.producer_commit(K_producer_state)
+                        K_producer_state.advance()
+
+                    tOrP_frg_pair.store(tSrS.load().to(self.K_dtype))
+
+                    K_wait_status = K_pipeline.consumer_try_wait(K_consumer_state)
+                    K_pipeline.consumer_wait(K_consumer_state, K_wait_status)
+                    gemm_smem_zero_acc(
+                        tiled_mma_qk,
+                        tSrS,
+                        tSrQ,
+                        tSrK,
+                        tSsK_copy[None, None, None, K_consumer_state.index],
+                        smem_tiled_copy_K,
+                    )
+                    K_pipeline.consumer_release(K_consumer_state)
+                    K_consumer_state.advance()
+
+                    if second_varblk < self.tile_size:
+                        mask(tSrS, tScS, second_varblk)
+
+                    next_count = load_count + 2
+                    if warp_idx == 0 and next_count < num_n_tiles:
+                        next_idx = gIndices[num_n_tiles - 1 - next_count]
+                        K_pipeline.producer_acquire(K_producer_state)
+                        cute.copy(
+                            tma_atom_K,
+                            tKgK[None, next_idx],
+                            tKsK[None, K_producer_state.index],
+                            tma_bar_ptr=K_pipeline.producer_get_barrier(
+                                K_producer_state
+                            ),
+                        )
+                        K_pipeline.producer_commit(K_producer_state)
+                        K_producer_state.advance()
+
+                    row_scale = online_softmax_reg_pair_first(
+                        tOrP_frg_pair,
+                        tSrS,
+                        max_m,
+                        sum_m,
+                        scale_softmax_log2e,
+                    )
+                    rescale_o_for_next_acc(tOrO, row_scale)
+
+                    V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
+                    V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
+                    gemm_rs_smem(
+                        tiled_mma_pv,
+                        tOrO,
+                        tOrP_pair,
+                        tOrV,
+                        tOsV_copy[None, None, None, V_consumer_state.index],
+                        smem_tiled_copy_V,
+                    )
+                    V_pipeline.consumer_release(V_consumer_state)
+                    V_consumer_state.advance()
+
+                    if warp_idx == 0:
+                        V_pipeline.producer_acquire(V_producer_state)
+                        cute.copy(
+                            tma_atom_V,
+                            tVgV[None, second_idx],
+                            tVsV[None, V_producer_state.index],
+                            tma_bar_ptr=V_pipeline.producer_get_barrier(
+                                V_producer_state
+                            ),
+                        )
+                        V_pipeline.producer_commit(V_producer_state)
+                        V_producer_state.advance()
+
+                    add_softmax_reg_pair_second(
+                        tSrS,
+                        tOrP_frg_pair,
+                        max_m,
+                        sum_m,
+                        scale_softmax_log2e,
+                    )
+
+                    V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
+                    V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
+                    gemm_rs_smem(
+                        tiled_mma_pv,
+                        tOrO,
+                        tOrP_pair,
+                        tOrV,
+                        tOsV_copy[None, None, None, V_consumer_state.index],
+                        smem_tiled_copy_V,
+                    )
+                    V_pipeline.consumer_release(V_consumer_state)
+                    V_consumer_state.advance()
+
+                    if warp_idx == 0 and next_count < num_n_tiles:
+                        next_idx = gIndices[num_n_tiles - 1 - next_count]
+                        V_pipeline.producer_acquire(V_producer_state)
+                        cute.copy(
+                            tma_atom_V,
+                            tVgV[None, next_idx],
+                            tVsV[None, V_producer_state.index],
+                            tma_bar_ptr=V_pipeline.producer_get_barrier(
+                                V_producer_state
+                            ),
+                        )
+                        V_pipeline.producer_commit(V_producer_state)
+                        V_producer_state.advance()
+                else:
+                    row_scale = online_softmax(
+                        tSrS, max_m, sum_m, scale_softmax_log2e
+                    )
+                    rescale_o_for_next_acc(tOrO, row_scale)
+                    tOrP_frg_pair.store(tSrS.load().to(self.K_dtype))
+
+                    V_wait_status = V_pipeline.consumer_try_wait(V_consumer_state)
+                    V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
+                    gemm_rs_smem(
+                        tiled_mma_pv,
+                        tOrO,
+                        tOrP_pair,
+                        tOrV,
+                        tOsV_copy[None, None, None, V_consumer_state.index],
+                        smem_tiled_copy_V,
+                    )
+                    V_pipeline.consumer_release(V_consumer_state)
+                    V_consumer_state.advance()
+
+        sequential_num_n_tiles = (
+            cutlass.Int32(0) if self.use_reg_pair else num_n_tiles
+        )
+        for load_count in cutlass.range(0, sequential_num_n_tiles, 1, unroll=1):
             n_tile_ind = num_n_tiles - 1 - load_count
             n_tile_idx = gIndices[n_tile_ind]
             if cutlass.const_expr(self.has_block_sizes):
@@ -890,6 +1073,94 @@ def should_skip_softmax(
         thread_wants_skip = thread_wants_skip and row_wants_skip
 
     return cute.arch.vote_all_sync(thread_wants_skip)
+
+
+@cute.jit
+def online_softmax_reg_pair_first(
+    first_scores: cute.Tensor,
+    second_scores: cute.Tensor,
+    row_max: cute.Tensor,
+    row_sum: cute.Tensor,
+    softmax_scale_log2e: cutlass.Float32,
+) -> cute.Tensor:
+    """Update pair-wide max/scale and turn the saved first scores into P."""
+    first_mn = layout_utils.reshape_acc_to_mn(first_scores)
+    second_mn = layout_utils.reshape_acc_to_mn(second_scores)
+    row_scale = cute.make_rmem_tensor_like(row_max, cutlass.Float32)
+
+    for m in cutlass.range(cute.size(row_max), unroll_full=True):
+        first_row = first_mn[m, None].load().to(cutlass.Float32)
+        second_row = second_mn[m, None].load()
+        row_max_cur = kernel_utils.fmax_reduce(
+            first_row,
+            init_val=row_max[m],
+            arch=80,
+        )
+        row_max_cur = kernel_utils.fmax_reduce(
+            second_row,
+            init_val=row_max_cur,
+            arch=80,
+        )
+        row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
+
+        row_max_prev = row_max[m]
+        row_max[m] = row_max_cur
+        row_max_safe = (
+            cutlass.Float32(0.0) if row_max_cur == -cutlass.Float32.inf else row_max_cur
+        )
+        row_max_scaled = row_max_safe * softmax_scale_log2e
+        first_exp = cute.math.exp2(
+            first_row * softmax_scale_log2e - row_max_scaled,
+            fastmath=True,
+        )
+        if row_max_prev == row_max_cur and row_max_cur != -cutlass.Float32.inf:
+            row_scale[m] = 1.0
+        else:
+            row_scale[m] = cute.math.exp2(
+                (row_max_prev - row_max_safe) * softmax_scale_log2e,
+                fastmath=True,
+            )
+        row_sum[m] = kernel_utils.fadd_reduce(
+            first_exp,
+            init_val=row_sum[m] * row_scale[m],
+            arch=80,
+        )
+        first_mn[m, None].store(first_exp.to(first_scores.element_type))
+
+    return row_scale
+
+
+@cute.jit
+def add_softmax_reg_pair_second(
+    second_scores: cute.Tensor,
+    probabilities: cute.Tensor,
+    row_max: cute.Tensor,
+    row_sum: cute.Tensor,
+    softmax_scale_log2e: cutlass.Float32,
+):
+    """Add the resident second score tile and overwrite the P fragment."""
+    second_mn = layout_utils.reshape_acc_to_mn(second_scores)
+    probabilities_mn = layout_utils.reshape_acc_to_mn(probabilities)
+
+    for m in cutlass.range(cute.size(row_sum), unroll_full=True):
+        row_max_safe = (
+            cutlass.Float32(0.0)
+            if row_max[m] == -cutlass.Float32.inf
+            else row_max[m]
+        )
+        second_exp = cute.math.exp2(
+            second_mn[m, None].load() * softmax_scale_log2e
+            - row_max_safe * softmax_scale_log2e,
+            fastmath=True,
+        )
+        row_sum[m] = kernel_utils.fadd_reduce(
+            second_exp,
+            init_val=row_sum[m],
+            arch=80,
+        )
+        probabilities_mn[m, None].store(
+            second_exp.to(probabilities.element_type)
+        )
 
 
 @cute.jit
