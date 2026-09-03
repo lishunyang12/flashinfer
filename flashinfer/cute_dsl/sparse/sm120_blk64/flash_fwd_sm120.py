@@ -353,7 +353,9 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 ),
                 tiled_mma_qk,
             )
-            tPsP_store = tiled_copy_p_r2s.get_slice(tidx).partition_D(sP)
+            tPsP_store = tiled_copy_p_r2s.get_slice(tidx).partition_D(sP)[
+                None, None, None, 0
+            ]
 
         max_m_layout = cute.make_layout(
             cute.size(layout_utils.reshape_acc_to_mn(tOrO).layout, mode=[0])
@@ -597,7 +599,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 ):
                     cute.copy(
                         smem_tiled_copy_P,
-                        tPsP_copy[None, None, k_block_idx],
+                        tPsP_copy[None, None, k_block_idx, 0],
                         tPrP_copy[None, None, k_block_idx],
                     )
 
