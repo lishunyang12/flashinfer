@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import operator
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -20,11 +21,38 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import cuda.bindings.driver as cuda
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import Int32, dsl_user_op
 from . import layout_utils
 from . import kernel_utils
 from .batched_static_scheduler import BatchedStaticSchedulerMixin
 
 SM120_FWD_BLOCK_SIZE = 64
+
+
+@dsl_user_op
+def _nanosleep(
+    sleep_time: int,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Emit nanosleep on CuTe DSL versions without the arch wrapper."""
+    if cutlass.const_expr(hasattr(cute.arch, "nanosleep")):
+        cute.arch.nanosleep(sleep_time=sleep_time, loc=loc, ip=ip)
+    else:
+        llvm.inline_asm(
+            res=None,
+            operands_=[Int32(sleep_time).ir_value(loc=loc, ip=ip)],
+            asm_string="nanosleep.u32 $0;",
+            constraints="r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
 
 
 # =============================================================================
@@ -133,7 +161,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         # resident CTA can issue BF16 MMA work during those gaps.  Zero keeps
         # the original schedule and makes this an opt-in tuning knob.
         if cta_stagger_ns > 0 and work_desc.qo_head_idx % 2 == 1:
-            cute.arch.nanosleep(sleep_time=cta_stagger_ns)
+            _nanosleep(cta_stagger_ns)
 
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
