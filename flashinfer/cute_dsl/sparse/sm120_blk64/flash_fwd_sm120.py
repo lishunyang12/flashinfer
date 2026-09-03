@@ -1305,6 +1305,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 self.Q_smem_layout,
                 self.K_smem_layout,
                 self.V_smem_layout,
+                self.P_smem_layout,
                 self.O_smem_layout,
                 softmax_scale * log2_e,
                 skip_softmax_threshold_log2,
