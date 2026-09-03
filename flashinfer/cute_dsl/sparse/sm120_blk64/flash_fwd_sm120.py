@@ -872,7 +872,6 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                     tSrQ,
                     tSrK,
                     tSsK_copy[None, None, None, k_stage],
-                    tSsK_copy[None, None, None, k_stage],
                     smem_tiled_copy_k,
                 )
                 K_pipeline.consumer_release(K_consumer_state)
